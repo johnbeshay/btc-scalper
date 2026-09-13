@@ -42,7 +42,7 @@ from pathlib import Path
 from core.kalshi_auth import SigningError, auth_headers, load_private_key
 
 # --- the line between practice and money ----------------------------------
-BASE = "https://demo-api.kalshi.co/trade-api/v2"
+BASE = "https://external-api.demo.kalshi.co/trade-api/v2"
 # Production is https://api.elections.kalshi.com/trade-api/v2
 # Read the module docstring before you change this.
 # --------------------------------------------------------------------------
