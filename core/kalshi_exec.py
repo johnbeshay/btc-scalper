@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -103,12 +104,19 @@ class DemoClient:
 
     # -- plumbing ---------------------------------------------------------
 
-    def _request(self, method: str, path: str, body: dict | None = None) -> dict:
+    def _request(self, method: str, path: str, body: dict | None = None,
+                 query: dict | None = None) -> dict:
         """
         `path` is the full API path, e.g. /trade-api/v2/portfolio/balance.
-        It is what gets signed, so it must not carry a query string.
+
+        `path` is what gets signed and must never carry a query string. Pass
+        query parameters via `query` instead: they are appended to the URL
+        after signing. Signing the query string is the single most common
+        cause of an unexplained 401 here.
         """
         url = self.base.replace("/trade-api/v2", "") + path
+        if query:
+            url = f"{url}?{urllib.parse.urlencode(query)}"
         payload = json.dumps(body).encode("utf-8") if body is not None else None
 
         try:
@@ -158,6 +166,23 @@ class DemoClient:
 
     def orders(self) -> dict:
         return self._request("GET", "/trade-api/v2/portfolio/orders")
+
+    def fills(self, limit: int = 200) -> dict:
+        """
+        Recent fills. Carries the fees that settlement revenue omits.
+
+        The limit is a query parameter, which must NOT appear in the signed
+        path - see kalshi_auth.signing_payload.
+        """
+        return self._request(
+            "GET", "/trade-api/v2/portfolio/fills", query={"limit": limit}
+        )
+
+    def settlements(self, limit: int = 200) -> dict:
+        """Settled markets, the source of realised P&L."""
+        return self._request(
+            "GET", "/trade-api/v2/portfolio/settlements", query={"limit": limit}
+        )
 
     def whoami(self) -> dict:
         """Cheapest call that proves auth works end to end."""

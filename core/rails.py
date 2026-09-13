@@ -23,9 +23,14 @@ codebase.
 
 STATE
 -----
-Realised P&L and per-window counts live in a small JSON file so the caps
-survive a restart. A restart is exactly when you would most like the daily
-loss cap to have forgotten - which is why it does not.
+Realised P&L, per-window counts, and the set of already-counted settlements
+live in a small JSON file so the caps survive a restart. A restart is exactly
+when you would most like the daily loss cap to have forgotten - which is why
+it does not.
+
+The applied-settlement ledger is what makes `executor.py sync` idempotent.
+Without it, running sync twice would double-count every loss, and a loss cap
+that miscounts is worse than no loss cap, because it is trusted.
 
 Standard library only. Nothing here imports `cryptography` or talks to a
 network; the rails must be testable and runnable on any machine.
@@ -82,7 +87,8 @@ def utc_day(at: datetime | None = None) -> str:
 
 class State:
     """
-    Persisted counters: realised P&L per day, orders per window.
+    Persisted counters: realised P&L per day, orders per window, and the
+    ledger of settlements already folded into P&L.
 
     Deliberately dumb. A corrupt or missing file resets to zero rather than
     raising, because a rails failure must never be the thing that stops you
@@ -91,7 +97,7 @@ class State:
 
     def __init__(self, path: str | Path = STATE_FILE):
         self.path = Path(path)
-        self.data = {"daily_pnl": {}, "window_orders": {}}
+        self.data = {"daily_pnl": {}, "window_orders": {}, "applied": {}}
         self._load()
 
     def _load(self) -> None:
@@ -104,6 +110,7 @@ class State:
         if isinstance(d, dict):
             self.data["daily_pnl"] = d.get("daily_pnl", {}) or {}
             self.data["window_orders"] = d.get("window_orders", {}) or {}
+            self.data["applied"] = d.get("applied", {}) or {}
 
     def save(self) -> None:
         try:
@@ -119,6 +126,12 @@ class State:
     def orders_in_window(self, window_id: str) -> int:
         return int(self.data["window_orders"].get(window_id, 0))
 
+    def already_applied(self, key: str) -> bool:
+        return key in self.data["applied"]
+
+    def applied_count(self) -> int:
+        return len(self.data["applied"])
+
     # -- writes -----------------------------------------------------------
 
     def record_order(self, window_id: str) -> None:
@@ -129,6 +142,18 @@ class State:
         day = day or utc_day()
         self.data["daily_pnl"][day] = round(self.pnl_today(day) + amount, 4)
         self.save()
+
+    def mark_applied(self, key: str, amount: float, day: str) -> None:
+        """
+        Record a settlement as counted. Idempotent by key.
+
+        Returns silently if the key is already present rather than
+        double-counting, so a repeated sync is harmless.
+        """
+        if self.already_applied(key):
+            return
+        self.data["applied"][key] = {"amount": round(amount, 4), "day": day}
+        self.record_pnl(amount, day)   # record_pnl saves
 
 
 def kill_switch_active(root: str | Path = ".") -> bool:

@@ -7,7 +7,9 @@ Demo executor. Manual, one order at a time.
   python executor.py order --ticker T --side yes --count 1 --price 40 \
                           --window 20260913T2245 --quoted-at <iso>
   python executor.py cancel --order-id ...
-  python executor.py pnl --amount -1.25       record a realised result
+  python executor.py sync                     see what settled (writes nothing)
+  python executor.py sync --apply             fold it into realised P&L
+  python executor.py pnl --amount -1.25       record a result by hand
 
 WHAT THIS DELIBERATELY DOES NOT DO
 ----------------------------------
@@ -39,6 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core import rails as R
+from core import reconcile
 from core.kalshi_exec import (
     BASE,
     IS_DEMO,
@@ -137,10 +140,85 @@ def cmd_rails(args) -> int:
     print("  " + "-" * 52)
     print(f"  utc day                  {day}")
     print(f"  realised pnl today       {state.pnl_today(day):+.2f}")
+    print(f"  settlements counted      {state.applied_count()}")
     kill = R.kill_switch_active(HERE)
     print(f"  kill switch              {'ACTIVE' if kill else 'clear'}")
     if kill:
         print(f"    remove {HERE / R.KILL_FILE} to resume")
+    print()
+    return 0
+
+
+def cmd_sync(args) -> int:
+    """
+    Derive realised P&L from the exchange rather than from memory.
+
+    Defaults to writing nothing. The field mapping in core/reconcile.py was
+    written against documentation, not against real responses, so the first
+    run should be read by a human before it is trusted to move the number
+    that gates trading.
+    """
+    banner()
+    try:
+        client = connect()
+        settlements = (client.settlements().get("settlements") or [])
+        fills = (client.fills().get("fills") or [])
+    except KalshiError as exc:
+        print(f"  {exc}\n")
+        return 1
+
+    state = R.State(HERE / R.STATE_FILE)
+    report = reconcile.sync(state, settlements, fills, apply=args.apply)
+
+    print(f"  {len(settlements)} settlement(s), {len(fills)} fill(s)")
+    print()
+
+    if args.raw and settlements:
+        print("  First raw settlement record, for checking the field mapping:")
+        print("  " + json.dumps(settlements[0], indent=2)[:600].replace("\n", "\n  "))
+        print()
+        if fills:
+            print("  First raw fill record:")
+            print("  " + json.dumps(fills[0], indent=2)[:400].replace("\n", "\n  "))
+            print()
+
+    if report.unparseable:
+        print(f"  {len(report.unparseable)} record(s) could not be read:")
+        for s_ in report.unparseable[:10]:
+            print(f"    {s_.describe()}")
+        print()
+        print("  These contribute NOTHING to P&L - they are not counted as zero.")
+        print("  Fix FIELD_NAMES in core/reconcile.py, then re-run.")
+        print()
+
+    if report.unreadable_fills:
+        print(f"  {report.unreadable_fills} fill(s) had no readable fee.")
+        print("  Fees are therefore understated, which flatters the P&L.")
+        print()
+
+    if report.skipped_duplicate:
+        print(f"  {len(report.skipped_duplicate)} already counted, skipped.")
+        print()
+
+    if report.applied:
+        print(f"  {len(report.applied)} new settlement(s):")
+        for s_ in report.applied:
+            print(f"    {s_.describe()}")
+        print()
+        print(f"  total {report.total_applied:+.2f}")
+    else:
+        print("  Nothing new to apply.")
+    print()
+
+    if not args.apply:
+        print("  Nothing written. Re-run with --apply once the numbers above")
+        print("  match what you see in the Kalshi web UI.")
+        print()
+        return 0
+
+    print(f"  Applied. Realised P&L today is now {state.pnl_today():+.2f}")
+    if not report.clean:
+        print("  NOTE: some records were unreadable, so this figure is incomplete.")
     print()
     return 0
 
@@ -262,7 +340,13 @@ def main() -> int:
     c.add_argument("--order-id", required=True)
     c.set_defaults(fn=cmd_cancel)
 
-    n = sub.add_parser("pnl", help="record a realised result")
+    sy = sub.add_parser("sync", help="derive P&L from settlements")
+    sy.add_argument("--apply", action="store_true", help="actually write it")
+    sy.add_argument("--raw", action="store_true",
+                    help="print a raw record to check the field mapping")
+    sy.set_defaults(fn=cmd_sync)
+
+    n = sub.add_parser("pnl", help="record a realised result by hand")
     n.add_argument("--amount", type=float, required=True)
     n.set_defaults(fn=cmd_pnl)
 
