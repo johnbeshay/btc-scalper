@@ -4,15 +4,15 @@ The learning layer.
 Two things are learned from the log, both chosen because they suit the amount
 of data this problem can realistically produce.
 
-1. CALIBRATION CORRECTION. The model outputs a probability. Reality says how
-   often that probability was right. Isotonic regression learns the mapping
-   between them - so if the model's "70%" is really 62%, the correction says
-   so. This needs hundreds of samples, not millions, and it directly attacks
-   the model's known weakness.
+  1. CALIBRATION CORRECTION. The model outputs a probability. Reality says how
+     often that probability was right. Isotonic regression learns the mapping
+     between them - so if the model's "70%" is really 62%, the correction says
+     so. This needs hundreds of samples, not millions, and it directly attacks
+     the model's known weakness.
 
-2. AGENT WEIGHTS. Each adjuster claims to improve the estimate. Ablation
-   measures whether it actually does, by scoring the log with that agent's
-   contribution removed. Agents that make predictions worse get turned down.
+  2. AGENT WEIGHTS. Each adjuster claims to improve the estimate. Ablation
+     measures whether it actually does, by scoring the log with that agent's
+     contribution removed. Agents that make predictions worse get turned down.
 
 WHY NOT A BIGGER MODEL
 ----------------------
@@ -36,6 +36,11 @@ EVERY LEARNED OUTPUT IS VALIDATED OUT OF SAMPLE
 Nothing here is emitted unless it beats the uncorrected model on data it was
 not fitted to. A correction that only improves in-sample is exactly the kind
 of self-deception this module exists to prevent.
+
+That rule now covers ablation too. An adjuster is only credited if it helps on
+the early period AND on the later period it was never inspected against. An
+adjuster that helps on one and hurts on the other is noise wearing a result's
+clothing.
 """
 
 from __future__ import annotations
@@ -46,15 +51,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import mean
 
-MIN_SAMPLES = 400          # below this, nothing is learned at all
-MIN_BUCKET = 25            # smallest group isotonic will trust
+MIN_SAMPLES = 400      # below this, nothing is learned at all
+MIN_BUCKET = 25        # smallest group isotonic will trust
 HOLDOUT_FRACTION = 0.3
 
 
 # --------------------------------------------------------------------------
 # Isotonic regression
 # --------------------------------------------------------------------------
-
 
 def pava(xs: list[float], ys: list[float]) -> list[tuple[float, float]]:
     """
@@ -66,10 +70,8 @@ def pava(xs: list[float], ys: list[float]) -> list[tuple[float, float]]:
     """
     if not xs:
         return []
-
     order = sorted(range(len(xs)), key=lambda i: xs[i])
-    blocks = [[xs[i], ys[i], 1] for i in order]  # [max_x, sum_y, count]
-
+    blocks = [[xs[i], ys[i], 1] for i in order]   # [max_x, sum_y, count]
     merged = []
     for b in blocks:
         merged.append(b)
@@ -80,7 +82,6 @@ def pava(xs: list[float], ys: list[float]) -> list[tuple[float, float]]:
             merged.pop()
             merged.pop()
             merged.append([c[0], a[1] + c[1], a[2] + c[2]])
-
     return [(b[0], b[1] / b[2]) for b in merged]
 
 
@@ -120,7 +121,6 @@ class IsotonicCalibrator:
 # Scoring helpers
 # --------------------------------------------------------------------------
 
-
 def brier(probs, hits) -> float:
     return sum((p - h) ** 2 for p, h in zip(probs, hits)) / len(probs)
 
@@ -142,7 +142,6 @@ def split(rows, fraction=HOLDOUT_FRACTION):
 @dataclass
 class LearnResult:
     """What was learned, and whether it survived validation."""
-
     accepted: bool
     reason: str
     n_train: int = 0
@@ -227,7 +226,77 @@ def learn_calibration(rows: list[dict]) -> LearnResult:
     )
 
 
-def ablate_agents(rows: list[dict]) -> dict:
+# --------------------------------------------------------------------------
+# Agent ablation
+# --------------------------------------------------------------------------
+
+def _p_without(sigma: float, spot: float, strike: float, mult: float) -> float | None:
+    """
+    Re-derive the probability with one agent's multiplier divided back out.
+
+    Returns None when the row cannot be recomputed.
+    """
+    if not sigma or not spot or not strike or mult is None or mult <= 0:
+        return None
+    without = sigma / mult
+    if without <= 0:
+        return None
+    return 0.5 * (1 + math.erf(math.log(spot / strike) / without / math.sqrt(2)))
+
+
+def _ablate_once(rows: list[dict], agents: set[str]) -> dict:
+    """
+    Score every agent on one set of rows.
+
+    The critical detail is that `kept_p` and `adjusted_p` are appended in the
+    same pass, so entry i of each refers to the same window. The previous
+    version sliced the first N rows of the log to build the baseline, which
+    silently compared two different sets of windows whenever any row was
+    skipped for missing fields - and then paired each probability with another
+    window's outcome. Every number it produced was meaningless.
+    """
+    scored = {}
+
+    for agent in sorted(agents):
+        kept_p, adjusted_p, hits, touched = [], [], [], 0
+
+        for r in rows:
+            info = (r.get("agents") or {}).get(agent)
+            if not info:
+                continue
+            mult = info.get("vol_multiplier", 1.0)
+            p_without = _p_without(
+                r.get("sigma"), r.get("spot"), r.get("strike"), mult
+            )
+            if p_without is None:
+                continue
+
+            if abs(mult - 1.0) > 1e-9:
+                touched += 1
+            kept_p.append(r["p"])
+            adjusted_p.append(p_without)
+            hits.append(r["hit"])
+
+        if len(adjusted_p) < MIN_BUCKET:
+            continue
+
+        with_score = brier(kept_p, hits)
+        without_score = brier(adjusted_p, hits)
+
+        scored[agent] = {
+            "brier_with": round(with_score, 6),
+            "brier_without": round(without_score, 6),
+            "helps": without_score > with_score,
+            "delta_pct": round((without_score - with_score) / with_score * 100, 2)
+            if with_score else 0.0,
+            "windows_affected": touched,
+            "n": len(adjusted_p),
+        }
+
+    return scored
+
+
+def ablate_agents(rows: list[dict], holdout: float | None = HOLDOUT_FRACTION) -> dict:
     """
     Measure each agent's real contribution by removing it.
 
@@ -235,63 +304,64 @@ def ablate_agents(rows: list[dict]) -> dict:
     ask what the model would have said without agent X, divide its multiplier
     back out and re-derive the probability. If accuracy improves without the
     agent, the agent is hurting.
+
+    With `holdout` set, the same measurement is repeated on a chronological
+    early/late split and each agent gets a `confirmed` flag: true only when the
+    sign of its contribution is the same in both periods. An adjuster tuned by
+    looking at the whole log will nearly always look good on the whole log.
+    Whether it still looks good on the later period is the only version of the
+    question worth asking.
+
+    Pass holdout=None for the single full-sample view.
     """
-    scored = {}
+    if not rows:
+        return {}
+
     agents = set()
     for r in rows:
         agents.update((r.get("agents") or {}).keys())
-
     if not agents:
         return {}
 
-    baseline = brier([r["p"] for r in rows], [r["hit"] for r in rows])
+    scored = _ablate_once(rows, agents)
+    if not scored:
+        return {}
 
-    for agent in sorted(agents):
-        adjusted_p, hits, touched = [], [], 0
-        for r in rows:
-            info = (r.get("agents") or {}).get(agent)
-            sigma, spot, strike = r.get("sigma"), r.get("spot"), r.get("strike")
-            if not info or not sigma or not spot or not strike:
-                continue
-            mult = info.get("vol_multiplier", 1.0)
-            if mult <= 0:
-                continue
-            if abs(mult - 1.0) > 1e-9:
-                touched += 1
-            without = sigma / mult
-            if without <= 0:
-                continue
-            adjusted_p.append(
-                0.5 * (1 + math.erf(math.log(spot / strike) / without / math.sqrt(2)))
-            )
-            hits.append(r["hit"])
+    if holdout:
+        train, test = split(rows, holdout)
+        train_scores = _ablate_once(train, agents) if train else {}
+        test_scores = _ablate_once(test, agents) if test else {}
 
-        if len(adjusted_p) < MIN_BUCKET:
-            continue
+        for name, s in scored.items():
+            tr = train_scores.get(name)
+            te = test_scores.get(name)
+            s["train"] = tr
+            s["test"] = te
+            if tr and te:
+                s["confirmed"] = tr["helps"] == te["helps"]
+                s["verdict"] = (
+                    ("helps" if te["helps"] else "hurts")
+                    if s["confirmed"] else "unproven"
+                )
+            else:
+                s["confirmed"] = False
+                s["verdict"] = "no holdout"
 
-        # Compare on exactly the rows that could be recomputed.
-        subset_base = brier(
-            [r["p"] for r in rows[: len(adjusted_p)]], hits[: len(adjusted_p)]
-        )
-        without_score = brier(adjusted_p, hits)
-        scored[agent] = {
-            "brier_with": round(subset_base, 6),
-            "brier_without": round(without_score, 6),
-            "helps": without_score > subset_base,
-            "delta_pct": round((without_score - subset_base) / subset_base * 100, 2)
-            if subset_base else 0.0,
-            "windows_affected": touched,
-            "n": len(adjusted_p),
+        scored["_holdout"] = {
+            "fraction": holdout,
+            "n_train": len(train),
+            "n_test": len(test),
         }
 
-    scored["_baseline_brier"] = round(baseline, 6)
+    scored["_baseline_brier"] = round(
+        brier([r["p"] for r in rows], [r["hit"] for r in rows]), 6
+    )
     return scored
 
 
 # --------------------------------------------------------------------------
 # Persistence
 # --------------------------------------------------------------------------
-
 
 MODEL_FILE = "learned.json"
 
