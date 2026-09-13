@@ -186,6 +186,11 @@ class TimeOfDayVol(Adjuster):
     name = "time_of_day"
     evidence = "strong"
 
+    SHRINK_PRIOR = 24    # samples needed before half the raw ratio is kept
+    CLAMP_LO = 0.85
+    CLAMP_HI = 1.20
+    DEADBAND = 0.02      # below this the correction is not worth applying
+
     def analyze(self, ctx: Context) -> Adjustment:
         if not ctx.hourly or len(ctx.hourly) < 120:
             return self._idle("needs more history than is loaded")
@@ -211,9 +216,28 @@ class TimeOfDayVol(Adjuster):
             return self._idle("no samples for this hour")
 
         ratio = mean(usable[hour]) / overall
-        # Clamp hard. A thin bucket producing a 3x multiplier would do more
-        # damage than the correction is worth.
-        mult = max(0.7, min(1.4, ratio))
+
+        # Shrink toward 1 by how little evidence the bucket holds.
+        #
+        # This is the fix for a real failure. With 300 hourly candles a bucket
+        # holds about 12 samples, and the standard error on a mean absolute
+        # return that size is roughly 30% of the mean - so a ratio can land at
+        # 1.4 or 0.7 on noise alone. It did: 38% of logged windows sat exactly
+        # on the old clamp, which is what an estimate pinned at its bounds by
+        # noise looks like, not a seasonal pattern.
+        #
+        # Clamping alone cannot fix that; it only caps how wrong the number
+        # gets. Shrinking scales the correction by the evidence behind it, so
+        # a thin bucket moves the multiplier a little and a thick one moves it
+        # more. n/(n+PRIOR) is the standard shrinkage weight: at n=12 it keeps
+        # about a third of the raw signal, at n=60 about three quarters.
+        n = len(usable[hour])
+        weight = n / (n + self.SHRINK_PRIOR)
+        shrunk = 1 + (ratio - 1) * weight
+
+        # Tighter clamp than before. With shrinkage doing the real work the
+        # clamp is a backstop against pathological input, not the main guard.
+        mult = max(self.CLAMP_LO, min(self.CLAMP_HI, shrunk))
 
         quietest = min(usable, key=lambda h: mean(usable[h]))
         busiest = max(usable, key=lambda h: mean(usable[h]))
@@ -221,12 +245,13 @@ class TimeOfDayVol(Adjuster):
         metrics = {
             "hour_utc": hour,
             "raw_ratio": round(ratio, 3),
-            "samples": len(usable[hour]),
+            "shrink_weight": round(weight, 3),
+            "samples": n,
             "quietest_hour_utc": quietest,
             "busiest_hour_utc": busiest,
         }
 
-        if abs(mult - 1) < 0.06:
+        if abs(mult - 1) < self.DEADBAND:
             return Adjustment(
                 self.name, self.evidence,
                 headline="Typical hour",
@@ -270,6 +295,10 @@ class VolUncertainty(Adjuster):
     name = "vol_uncertainty"
     evidence = "strong"
 
+    WIDEN = 0.0          # 0 disables widening; 0.5 was the old behaviour
+    WIDEN_CAP = 1.5
+    SUPPRESS_AT = 0.8    # unchanged - the safety flag stays on
+
     def analyze(self, ctx: Context) -> Adjustment:
         d = ctx.vol.disagreement
         if d is None:
@@ -282,9 +311,20 @@ class VolUncertainty(Adjuster):
             "close_to_close": ctx.vol.close_to_close,
         }
 
-        # Half the spread, capped. Widening by the full disagreement would
-        # double-count, since the blend already sits between the estimates.
-        mult = min(1 + d * 0.5, 1.5)
+        # Widening is off. The reasoning behind it is sound - uncertainty
+        # about a parameter really does widen the distribution around it -
+        # but it was the wrong correction for this model.
+        #
+        # Ablation on 1,278 logged calls: removing this agent's multiplier
+        # improved Brier by 0.9%. The mechanism is visible in the scores.
+        # Widening pushes probabilities toward 50%, and near the money this
+        # model's favoured side already wins MORE often than it claims
+        # (confidence bias +7.5%). It is underconfident there, so widening
+        # made it worse. The fix is not to widen less but to stop widening,
+        # which is exactly what the ablation measured.
+        #
+        # Set WIDEN above 0 to turn it back on if later data disagrees.
+        mult = min(1 + d * self.WIDEN, self.WIDEN_CAP) if self.WIDEN else 1.0
 
         # The threshold is 0.4, not 0.25, because the three estimators measure
         # different things - Parkinson reads the bar range, close-to-close
@@ -302,7 +342,7 @@ class VolUncertainty(Adjuster):
                 metrics=metrics,
             )
 
-        if d > 0.8:
+        if d > self.SUPPRESS_AT:
             return Adjustment(
                 self.name, self.evidence,
                 vol_multiplier=mult, suppress=True,
@@ -320,8 +360,9 @@ class VolUncertainty(Adjuster):
             vol_multiplier=mult,
             headline="Volatility unclear",
             detail=(
-                f"The measures disagree by {d * 100:.0f}%, so the range is widened "
-                f"{(mult - 1) * 100:.0f}% to reflect what is not known."
+                f"The measures disagree by {d * 100:.0f}%. Flagged, but the "
+                "estimate is left alone - widening on this signal was measured "
+                "to make predictions worse, not better."
             ),
             metrics=metrics,
         )
