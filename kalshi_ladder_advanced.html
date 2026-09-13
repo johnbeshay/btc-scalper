@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kalshi BTC ladder</title>
+<style>
+:root {
+  --ink:#131210; --ink-2:#1c1a17; --ink-3:#24211c;
+  --rule:#322c23; --rule-soft:#262119;
+  --wheat:#eae4d6; --dim:#9c9486; --faint:#6a6456;
+  --amber:#e3a640; --green:#6cb267; --red:#cb5a50; --blue:#6d9ac4;
+  --mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;background:var(--ink);color:var(--wheat);
+  font:15px/1.55 "Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  padding:22px 20px 70px;
+}
+.wrap{max-width:1080px;margin:0 auto}
+
+header{display:flex;justify-content:space-between;align-items:baseline;gap:14px;
+  flex-wrap:wrap;padding-bottom:12px;border-bottom:1px solid var(--rule)}
+h1{font-size:15px;font-weight:500;margin:0}
+#conn{font-family:var(--mono);font-size:12px;color:var(--faint)}
+
+.top{display:grid;grid-template-columns:minmax(0,1fr) 250px;gap:22px;margin:20px 0 24px}
+@media(max-width:780px){.top{grid-template-columns:1fr}}
+
+.clock{border:1px solid var(--rule);border-left:3px solid var(--amber);background:var(--ink-2);
+  padding:18px 20px}
+.clock-t{font-family:var(--mono);font-size:44px;line-height:1;font-weight:500}
+.clock-t.urgent{color:var(--amber)}
+.clock-l{font-size:12px;color:var(--faint);margin-top:7px}
+
+.readouts{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));
+  gap:1px;background:var(--rule);border:1px solid var(--rule)}
+.ro{background:var(--ink-2);padding:11px 13px}
+.ro dt{font-size:11px;color:var(--faint);margin-bottom:3px}
+.ro dd{font-family:var(--mono);font-size:17px;margin:0}
+.ro dd small{font-size:11px;color:var(--faint)}
+
+.warnbar{margin:0 0 18px;padding:11px 15px;border:1px solid var(--amber);
+  background:rgba(227,166,64,.07);font-size:13px;color:var(--amber);display:none}
+.warnbar.on{display:block}
+
+h2{font-size:12px;font-weight:500;color:var(--dim);margin:0 0 9px;
+  display:flex;justify-content:space-between;align-items:baseline}
+h2 span{font-family:var(--mono);font-size:11px;color:var(--faint);font-weight:400}
+
+table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:13px}
+thead th{font-family:inherit;font-size:11px;font-weight:400;color:var(--faint);
+  text-align:right;padding:0 10px 7px;border-bottom:1px solid var(--rule)}
+thead th:first-child{text-align:left}
+tbody td{padding:7px 10px;text-align:right;border-bottom:1px solid var(--rule-soft)}
+tbody td:first-child{text-align:left}
+tbody tr.spot-row{background:rgba(109,154,196,.08)}
+tbody tr.spot-row td{border-top:1px solid var(--blue);border-bottom:1px solid var(--blue)}
+.strike{color:var(--wheat)}
+.spot-row .strike{color:var(--blue)}
+.fair{color:var(--wheat)}
+.dist{color:var(--faint);font-size:12px}
+.dist.tail{color:var(--amber)}
+input.ask{width:56px;background:var(--ink-3);border:1px solid var(--rule);
+  color:var(--wheat);font-family:var(--mono);font-size:13px;padding:3px 6px;
+  text-align:right;border-radius:2px}
+input.ask:focus{outline:none;border-color:var(--blue)}
+input.ask::placeholder{color:var(--faint)}
+.edge{font-weight:500}
+.edge.good{color:var(--green)}
+.edge.bad{color:var(--red)}
+.edge.flat{color:var(--faint)}
+.verdict{font-size:11px;padding:1px 6px;border:1px solid;border-radius:2px}
+.verdict.take{color:var(--green);border-color:var(--green)}
+.verdict.tail{color:var(--amber);border-color:var(--amber)}
+
+.foot{margin-top:22px;font-size:12px;color:var(--faint);max-width:66ch}
+.foot code{font-family:var(--mono);color:var(--dim)}
+.err{margin:20px 0;padding:14px 16px;border:1px solid var(--red);background:var(--ink-2);
+  font-size:14px;display:none}
+.err.on{display:block}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Kalshi BTC ladder</h1>
+  <span id="conn">connecting</span>
+</header>
+
+<div class="err" id="err"></div>
+
+<div class="top">
+  <div class="clock">
+    <div class="clock-t" id="clock">--:--</div>
+    <div class="clock-l" id="clock-label">until the window closes</div>
+  </div>
+  <dl class="readouts">
+    <div class="ro"><dt>BTC spot</dt><dd id="r-spot">&mdash;</dd></div>
+    <div class="ro"><dt>Move left in window</dt><dd id="r-move">&mdash;</dd></div>
+    <div class="ro"><dt>Vol agreement</dt><dd id="r-agree">&mdash;</dd></div>
+    <div class="ro"><dt>Fee multiplier</dt><dd id="r-mult">&mdash;</dd></div>
+  </dl>
+</div>
+
+<div class="warnbar" id="warn"></div>
+
+<h2>Strike ladder <span id="ladder-note">type what the book is asking to see your edge</span></h2>
+<table>
+  <thead>
+    <tr>
+      <th>Strike</th><th>YES fair</th><th>NO fair</th><th>Distance</th>
+      <th>YES ask</th><th>NO ask</th><th>Best edge</th><th></th>
+    </tr>
+  </thead>
+  <tbody id="ladder"></tbody>
+</table>
+
+<p class="foot">
+  Fair value decays toward 0 or 100 as the clock runs down, so the ladder
+  redraws every second. Edge is expected value per contract after the Kalshi
+  fee. Anything under <code>2c</code> is inside the model's own error bar and
+  shows as flat. Strikes past two standard deviations are flagged: real
+  Bitcoin returns have fatter tails than the model assumes, so out there the
+  market is usually right and the model is usually wrong.
+</p>
+
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let MK = null;              // latest market payload
+let closeAt = null;         // Date the window closes
+const asks = {};            // strike -> {yes, no} as typed by the user
+
+const normCdf = x => {
+  // Abramowitz-Stegun 7.1.26 approximation of erf.
+  const s = x < 0 ? -1 : 1, ax = Math.abs(x) / Math.SQRT2;
+  const t = 1 / (1 + 0.3275911 * ax);
+  const y = 1 - ((((1.061405429*t - 1.453152027)*t + 1.421413741)*t
+    - 0.284496736)*t + 0.254829592) * t * Math.exp(-ax*ax);
+  return 0.5 * (1 + s*y);
+};
+
+const probAbove = (spot, strike, sigma) =>
+  sigma <= 0 ? (spot > strike ? 1 : 0)
+             : normCdf(Math.log(spot/strike) / sigma);
+
+const feePerContract = (price, mult) => {
+  // Kalshi rounds up to the cent on the order; assume a 10-lot.
+  const c = 10;
+  return Math.ceil(Math.round(mult * c * price * (1-price) * 1e9)/1e9 * 100)/100 / c;
+};
+
+function secondsLeft() {
+  if (!closeAt) return 0;
+  return Math.max(0, (closeAt - Date.now()) / 1000);
+}
+
+function buildLadder() {
+  if (!MK) return;
+  const secs = secondsLeft();
+  const mins = secs / 60;
+  const spot = MK.spot;
+  const sigma = MK.sigma_per_min * Math.sqrt(Math.max(mins, 0.0001));
+
+  $('clock').textContent =
+    String(Math.floor(secs/60)).padStart(2,'0') + ':' +
+    String(Math.floor(secs%60)).padStart(2,'0');
+  $('clock').classList.toggle('urgent', secs < 120);
+  $('clock-label').textContent = secs < 120
+    ? 'closing soon, fair value is collapsing fast'
+    : 'until the window closes';
+
+  $('r-spot').textContent = '$' + spot.toLocaleString('en-US',{maximumFractionDigits:0});
+  $('r-move').textContent = '$' + Math.round(spot*sigma).toLocaleString();
+  const dis = MK.disagreement;
+  $('r-agree').innerHTML = dis == null ? '&mdash;'
+    : (dis < 0.35 ? 'tight' : dis < 0.6 ? 'loose' : 'poor') +
+      ' <small>' + Math.round(dis*100) + '%</small>';
+  $('r-mult').textContent = MK.taker_multiplier;
+
+  const warn = $('warn');
+  if (dis != null && dis > 0.6) {
+    warn.textContent = 'The three volatility estimators disagree by ' +
+      Math.round(dis*100) + '%. The vol regime is shifting and every number ' +
+      'below is softer than it looks. Do not act on a thin edge right now.';
+    warn.classList.add('on');
+  } else if (secs < 60) {
+    warn.textContent = 'Under a minute left. Prices are nearly settled and ' +
+      'any model edge is mostly noise.';
+    warn.classList.add('on');
+  } else warn.classList.remove('on');
+
+  const step = Math.max(Math.round(spot * MK.sigma_per_min * Math.sqrt(15) * 0.5 / 10) * 10, 10);
+  const rows = [];
+  for (let k = 4; k >= -4; k--) {
+    const strike = Math.round((spot + k*step)/10)*10;
+    const pYes = probAbove(spot, strike, sigma);
+    const sd = sigma > 0 ? Math.abs(Math.log(spot/strike)/sigma) : 0;
+    const tail = sd >= 2;
+    const a = asks[strike] || {};
+    let best = null;
+
+    [['yes',pYes,a.yes],['no',1-pYes,a.no]].forEach(([side,fair,askC]) => {
+      if (askC == null || askC <= 0 || askC >= 100) return;
+      const price = askC/100;
+      const ev = fair - price - feePerContract(price, MK.taker_multiplier);
+      if (!best || ev > best.ev) best = {side, ev};
+    });
+
+    const cls = !best ? 'flat' : best.ev >= 0.02 ? 'good' : best.ev <= -0.02 ? 'bad' : 'flat';
+    const edgeTxt = !best ? '&mdash;'
+      : (best.ev >= 0 ? '+' : '') + (best.ev*100).toFixed(1) + 'c ' + best.side.toUpperCase();
+    const verdict = best && best.ev >= 0.02
+      ? (tail ? '<span class="verdict tail">tail</span>'
+              : '<span class="verdict take">take</span>')
+      : '';
+
+    const isSpot = Math.abs(strike - spot) < step/2;
+    rows.push(
+      '<tr class="' + (isSpot?'spot-row':'') + '">' +
+      '<td class="strike">' + strike.toLocaleString() + '</td>' +
+      '<td class="fair">' + (pYes*100).toFixed(1) + 'c</td>' +
+      '<td class="fair">' + ((1-pYes)*100).toFixed(1) + 'c</td>' +
+      '<td class="dist' + (tail?' tail':'') + '">' + sd.toFixed(1) + ' sd</td>' +
+      '<td><input class="ask" data-k="'+strike+'" data-s="yes" placeholder="--" ' +
+        'value="'+(a.yes ?? '')+'" inputmode="numeric"></td>' +
+      '<td><input class="ask" data-k="'+strike+'" data-s="no" placeholder="--" ' +
+        'value="'+(a.no ?? '')+'" inputmode="numeric"></td>' +
+      '<td class="edge ' + cls + '">' + edgeTxt + '</td>' +
+      '<td>' + verdict + '</td></tr>'
+    );
+  }
+
+  const active = document.activeElement;
+  const keep = active && active.classList.contains('ask')
+    ? {k: active.dataset.k, s: active.dataset.s, pos: active.selectionStart} : null;
+
+  $('ladder').innerHTML = rows.join('');
+
+  if (keep) {
+    const el = document.querySelector(
+      'input.ask[data-k="'+keep.k+'"][data-s="'+keep.s+'"]');
+    if (el) { el.focus(); try { el.setSelectionRange(keep.pos, keep.pos); } catch(e){} }
+  }
+}
+
+document.addEventListener('input', e => {
+  if (!e.target.classList.contains('ask')) return;
+  const k = e.target.dataset.k, s = e.target.dataset.s;
+  const v = e.target.value.trim();
+  asks[k] = asks[k] || {};
+  asks[k][s] = v === '' ? null : parseFloat(v);
+  buildLadder();
+});
+
+async function poll() {
+  try {
+    const d = await (await fetch('/api/market')).json();
+    if (!d.ok) {
+      $('err').textContent = 'Price feed is not responding: ' + (d.error || '');
+      $('err').classList.add('on');
+      $('conn').textContent = 'feed down';
+      return;
+    }
+    $('err').classList.remove('on');
+    MK = d;
+    closeAt = new Date(d.window_close);
+    $('conn').textContent = d.stale ? 'cached' : 'live';
+    buildLadder();
+  } catch (e) {
+    $('err').textContent = 'Cannot reach the local server. Is it still running?';
+    $('err').classList.add('on');
+    $('conn').textContent = 'disconnected';
+  }
+}
+
+poll();
+setInterval(poll, 15000);
+setInterval(buildLadder, 1000);
+</script>
+</body>
+</html>

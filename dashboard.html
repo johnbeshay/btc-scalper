@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BTC scalper</title>
+<style>
+:root {
+  --ink: #14120f;
+  --ink-2: #1d1a16;
+  --ink-3: #262119;
+  --rule: #332c22;
+  --wheat: #e8e2d4;
+  --wheat-dim: #9a9384;
+  --wheat-faint: #6b6558;
+  --amber: #e0a33c;
+  --green: #6fae6a;
+  --red: #c9584f;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--ink); color: var(--wheat);
+  font-family: var(--sans); font-size: 15px; line-height: 1.6;
+  padding: 28px 24px 60px;
+}
+.wrap { max-width: 1180px; margin: 0 auto; }
+
+header {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 16px; flex-wrap: wrap;
+  padding-bottom: 14px; border-bottom: 1px solid var(--rule);
+}
+h1 { font-size: 16px; font-weight: 500; margin: 0; letter-spacing: .01em; }
+.meta { font-family: var(--mono); font-size: 12px; color: var(--wheat-faint); }
+
+/* Hero: the verdict, not the price. */
+.verdict {
+  margin: 26px 0 30px; padding: 26px 28px;
+  border: 1px solid var(--rule); border-left: 3px solid var(--wheat-faint);
+  background: var(--ink-2);
+}
+.verdict.go-long  { border-left-color: var(--green); }
+.verdict.go-short { border-left-color: var(--red); }
+.verdict.veto     { border-left-color: var(--amber); }
+
+.verdict-line { font-size: 30px; font-weight: 500; line-height: 1.25; margin: 0; }
+.verdict-why {
+  margin: 10px 0 0; color: var(--wheat-dim); max-width: 62ch; font-size: 14px;
+}
+.verdict-score {
+  font-family: var(--mono); font-size: 12px; color: var(--wheat-faint);
+  margin-top: 14px;
+}
+
+.numbers {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 1px; background: var(--rule); border: 1px solid var(--rule);
+  margin-bottom: 30px;
+}
+.num { background: var(--ink-2); padding: 14px 16px; }
+.num dt { font-size: 12px; color: var(--wheat-faint); margin: 0 0 4px; }
+.num dd { font-family: var(--mono); font-size: 19px; margin: 0; }
+.num dd.small { font-size: 15px; }
+
+canvas { display: block; width: 100%; height: 260px; border: 1px solid var(--rule); }
+.chart-note {
+  font-family: var(--mono); font-size: 11px; color: var(--wheat-faint);
+  margin: 6px 0 30px; display: flex; gap: 18px; flex-wrap: wrap;
+}
+
+h2 { font-size: 13px; font-weight: 500; color: var(--wheat-dim); margin: 0 0 12px; }
+
+.agents { display: grid; gap: 1px; background: var(--rule); border: 1px solid var(--rule); }
+.agent {
+  background: var(--ink-2); padding: 13px 16px;
+  display: grid; grid-template-columns: 108px 130px 1fr auto; gap: 16px;
+  align-items: baseline;
+}
+.agent-name { font-family: var(--mono); font-size: 13px; color: var(--wheat-dim); }
+.agent-call { font-size: 14px; }
+.agent-call.bullish { color: var(--green); }
+.agent-call.bearish { color: var(--red); }
+.agent-call.neutral { color: var(--wheat-faint); }
+.agent-detail { font-size: 13px; color: var(--wheat-dim); }
+.agent-flag {
+  font-family: var(--mono); font-size: 11px; color: var(--amber);
+  white-space: nowrap;
+}
+.conf { font-family: var(--mono); font-size: 11px; color: var(--wheat-faint); }
+
+.status {
+  margin-top: 26px; font-family: var(--mono); font-size: 11px;
+  color: var(--wheat-faint); display: flex; gap: 18px; flex-wrap: wrap;
+}
+.err {
+  margin: 26px 0; padding: 16px 18px; border: 1px solid var(--red);
+  background: var(--ink-2); font-size: 14px;
+}
+.err code {
+  font-family: var(--mono); font-size: 13px; color: var(--amber);
+  display: block; margin-top: 8px;
+}
+@media (max-width: 720px) {
+  .agent { grid-template-columns: 1fr; gap: 4px; }
+  .verdict-line { font-size: 23px; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>BTC scalper</h1>
+  <span class="meta" id="meta">connecting</span>
+</header>
+
+<div id="error-slot"></div>
+
+<section class="verdict" id="verdict">
+  <p class="verdict-line" id="verdict-line">Waiting for data</p>
+  <p class="verdict-why" id="verdict-why">Reading the exchange feed.</p>
+  <p class="verdict-score" id="verdict-score"></p>
+</section>
+
+<dl class="numbers">
+  <div class="num"><dt>Price</dt><dd id="n-price">&mdash;</dd></div>
+  <div class="num"><dt>Round trip cost</dt><dd id="n-cost">&mdash;</dd></div>
+  <div class="num"><dt>Breakeven long</dt><dd class="small" id="n-be-long">&mdash;</dd></div>
+  <div class="num"><dt>Breakeven short</dt><dd class="small" id="n-be-short">&mdash;</dd></div>
+  <div class="num"><dt>Next refresh</dt><dd class="small" id="n-next">&mdash;</dd></div>
+</dl>
+
+<canvas id="chart" width="1160" height="260"></canvas>
+<p class="chart-note">
+  <span>last 60 candles</span>
+  <span id="chart-range">&mdash;</span>
+  <span id="chart-be">breakeven line dashed</span>
+</p>
+
+<h2>Agents</h2>
+<div class="agents" id="agents"></div>
+
+<p class="status">
+  <span id="s-updated">&mdash;</span>
+  <span id="s-source">&mdash;</span>
+</p>
+
+</div>
+
+<script>
+const REFRESH_MS = 30000;
+let nextAt = 0;
+
+const $ = id => document.getElementById(id);
+const money = n => '$' + n.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+
+function showError(msg, hint) {
+  $('error-slot').innerHTML =
+    '<div class="err">' + msg + (hint ? '<code>' + hint + '</code>' : '') + '</div>';
+}
+function clearError() { $('error-slot').innerHTML = ''; }
+
+function renderVerdict(d) {
+  const box = $('verdict');
+  box.className = 'verdict';
+
+  if (d.vetoed) {
+    box.classList.add('veto');
+    $('verdict-line').textContent = 'Stand down';
+    $('verdict-why').textContent = d.veto_reason;
+  } else if (d.direction === 'bullish') {
+    box.classList.add('go-long');
+    $('verdict-line').textContent = d.headline;
+    $('verdict-why').textContent =
+      'Agents lean long. Confirm against your own read before entering.';
+  } else if (d.direction === 'bearish') {
+    box.classList.add('go-short');
+    $('verdict-line').textContent = d.headline;
+    $('verdict-why').textContent =
+      'Agents lean short. Confirm against your own read before entering.';
+  } else {
+    $('verdict-line').textContent = d.headline;
+    $('verdict-why').textContent =
+      'Nothing lines up well enough to act on. Sitting out is a position.';
+  }
+
+  const tradeable = d.signals.filter(s => s.tradeable === true).length;
+  const gated = d.signals.filter(s => s.tradeable === false).length;
+  $('verdict-score').textContent =
+    'alignment ' + d.score + '/100   ·   ' + tradeable +
+    ' signal(s) clear costs, ' + gated + ' below the floor';
+}
+
+function renderNumbers(d) {
+  $('n-price').textContent = money(d.price);
+  $('n-cost').textContent = d.round_trip_cost_pct.toFixed(2) + '%';
+  $('n-be-long').textContent = money(d.breakeven_long);
+  $('n-be-short').textContent = money(d.breakeven_short);
+}
+
+function renderAgents(d) {
+  $('agents').innerHTML = d.signals.map(s => {
+    const flag = s.tradeable === false
+      ? '<span class="agent-flag">below cost floor</span>' : '<span></span>';
+    return '<div class="agent">' +
+      '<span class="agent-name">' + s.agent + '</span>' +
+      '<span class="agent-call ' + s.direction + '">' + s.headline +
+        ' <span class="conf">' + s.confidence + '</span></span>' +
+      '<span class="agent-detail">' + s.detail + '</span>' + flag +
+    '</div>';
+  }).join('');
+}
+
+function drawChart(d) {
+  const cv = $('chart');
+  const ctx = cv.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const cs = d.candles;
+  if (!cs || !cs.length) return;
+
+  const padL = 8, padR = 74, padY = 14;
+  const lo = Math.min(...cs.map(c => c.l), d.breakeven_short);
+  const hi = Math.max(...cs.map(c => c.h), d.breakeven_long);
+  const span = (hi - lo) || 1;
+  const y = p => padY + (hi - p) / span * (h - padY * 2);
+  const cw = (w - padL - padR) / cs.length;
+
+  // Breakeven envelope: the band inside which a trade cannot profit.
+  ctx.fillStyle = 'rgba(224,163,60,0.06)';
+  ctx.fillRect(padL, y(d.breakeven_long), w - padL - padR, y(d.breakeven_short) - y(d.breakeven_long));
+
+  ctx.setLineDash([3, 4]);
+  ctx.strokeStyle = 'rgba(224,163,60,0.55)';
+  ctx.lineWidth = 1;
+  [d.breakeven_long, d.breakeven_short].forEach(p => {
+    ctx.beginPath(); ctx.moveTo(padL, y(p)); ctx.lineTo(w - padR, y(p)); ctx.stroke();
+  });
+  ctx.setLineDash([]);
+
+  cs.forEach((c, i) => {
+    const x = padL + i * cw + cw / 2;
+    const up = c.c >= c.o;
+    ctx.strokeStyle = up ? '#6fae6a' : '#c9584f';
+    ctx.fillStyle = up ? '#6fae6a' : '#c9584f';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, y(c.h)); ctx.lineTo(x, y(c.l)); ctx.stroke();
+    const top = y(Math.max(c.o, c.c));
+    const bh = Math.max(Math.abs(y(c.o) - y(c.c)), 1);
+    ctx.fillRect(x - cw * 0.32, top, Math.max(cw * 0.64, 1), bh);
+  });
+
+  ctx.fillStyle = '#9a9384';
+  ctx.font = '11px ui-monospace, Menlo, Consolas, monospace';
+  ctx.textAlign = 'left';
+  [[d.breakeven_long, 'BE long'], [cs[cs.length - 1].c, 'now'], [d.breakeven_short, 'BE short']]
+    .forEach(([p, label]) => ctx.fillText(label + ' ' + Math.round(p).toLocaleString(), w - padR + 6, y(p) + 3));
+
+  $('chart-range').textContent =
+    Math.round(lo).toLocaleString() + ' – ' + Math.round(hi).toLocaleString();
+}
+
+async function tick() {
+  try {
+    const res = await fetch('/api/verdict');
+    const d = await res.json();
+
+    if (!d.ok) {
+      showError('The exchange feed is not responding.', d.error || '');
+      $('meta').textContent = 'feed down';
+      return;
+    }
+
+    clearError();
+    renderVerdict(d);
+    renderNumbers(d);
+    renderAgents(d);
+    drawChart(d);
+
+    $('meta').textContent = 'live';
+    $('s-updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+    $('s-source').textContent = d.stale ? 'serving cached candles' : 'feed ok';
+    nextAt = Date.now() + REFRESH_MS;
+  } catch (e) {
+    showError('Cannot reach the local server. Is it still running?',
+              'python3 server.py');
+    $('meta').textContent = 'disconnected';
+  }
+}
+
+setInterval(() => {
+  const left = Math.max(0, Math.ceil((nextAt - Date.now()) / 1000));
+  $('n-next').textContent = left + 's';
+}, 1000);
+
+tick();
+setInterval(tick, REFRESH_MS);
+window.addEventListener('resize', () => {
+  fetch('/api/verdict').then(r => r.json()).then(d => d.ok && drawChart(d)).catch(() => {});
+});
+</script>
+</body>
+</html>

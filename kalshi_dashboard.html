@@ -1,0 +1,770 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bitcoin window</title>
+<style>
+:root{
+  --bg:#0e1116;--panel:#151a21;--panel2:#1b212a;--line:#252d38;--line2:#1e242d;
+  --fg:#e6eaf0;--mid:#8e99a8;--low:#5d6774;
+  --cyan:#4fb3c9;--amber:#d9a441;--green:#5fb37a;--red:#c9605a;
+  --mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:16px/1.6 "Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  padding:0 20px 90px}
+.wrap{max-width:820px;margin:0 auto}
+
+.bar{display:flex;justify-content:space-between;align-items:center;gap:16px;
+  padding:16px 0;border-bottom:1px solid var(--line);margin-bottom:28px;flex-wrap:wrap}
+.price{font-family:var(--mono);font-size:26px;font-weight:500;letter-spacing:-.01em}
+.price .tick{font-size:13px;color:var(--mid);margin-left:8px;font-weight:400}
+.rt{display:flex;align-items:center;gap:18px}
+.count{font-family:var(--mono);font-size:26px;font-weight:500}
+.count.warn{color:var(--amber)}
+.count small{display:block;font-family:inherit;font-size:11px;color:var(--low);
+  font-weight:400;letter-spacing:.02em;text-align:right}
+#conn{font-family:var(--mono);font-size:11px;color:var(--low)}
+
+.hero{background:var(--panel);border:1px solid var(--line);padding:22px 24px 16px;
+  margin-bottom:14px}
+.hero h3{font-size:13px;font-weight:400;color:var(--mid);margin:0 0 4px}
+.hero .lead{font-size:19px;line-height:1.45;margin:0 0 18px;color:var(--fg)}
+.hero .lead b{color:var(--cyan);font-weight:500}
+canvas{display:block;width:100%;height:190px}
+.axis{display:flex;justify-content:space-between;font-family:var(--mono);
+  font-size:11px;color:var(--low);margin-top:2px}
+
+.stop{background:rgba(217,164,65,.08);border:1px solid var(--amber);color:var(--amber);
+  padding:13px 16px;font-size:14px;margin-bottom:14px;display:none}
+.stop.on{display:block}
+
+h2{font-size:12px;font-weight:500;color:var(--low);letter-spacing:.06em;
+  text-transform:uppercase;margin:30px 0 12px}
+
+.panel{background:var(--panel);border:1px solid var(--line);padding:20px 22px}
+.grid{display:grid;grid-template-columns:1fr 1fr 1.2fr;gap:16px}
+.grid.g4{grid-template-columns:1.2fr .8fr .9fr 1fr}
+@media(max-width:760px){.grid,.grid.g4{grid-template-columns:1fr 1fr}}
+@media(max-width:460px){.grid,.grid.g4{grid-template-columns:1fr}}
+.money{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line2);
+  margin-bottom:16px}
+.mcell{background:var(--panel2);padding:14px 16px}
+.mcell dt{font-size:11px;color:var(--low);margin-bottom:3px}
+.mcell dd{font-family:var(--mono);font-size:22px;margin:0;font-weight:500}
+.mcell.win dd{color:var(--green)}
+.mcell.lose dd{color:var(--red)}
+.mcell dd small{font-size:12px;color:var(--low);font-weight:400;margin-left:5px}
+label{display:block;font-size:12px;color:var(--mid);margin-bottom:6px}
+label em{font-style:normal;color:var(--low)}
+input[type=number]{width:100%;background:var(--bg);border:1px solid var(--line);
+  color:var(--fg);font-family:var(--mono);font-size:17px;padding:10px 12px;border-radius:2px}
+input:focus{outline:none;border-color:var(--cyan)}
+.seg{display:flex}
+.seg button{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--mid);
+  font:inherit;font-size:14px;padding:10px 4px;cursor:pointer}
+.seg button+button{border-left:none}
+.seg button.on{background:var(--cyan);border-color:var(--cyan);color:#0b1014;font-weight:500}
+
+.out{margin-top:22px;padding-top:20px;border-top:1px solid var(--line);display:none}
+.out.on{display:block}
+.big{font-size:27px;font-weight:500;margin:0 0 10px;letter-spacing:-.01em}
+.out.good .big{color:var(--green)}
+.out.bad .big{color:var(--red)}
+.out.risky .big{color:var(--amber)}
+.out.meh .big{color:var(--mid)}
+.say{margin:0 0 16px;font-size:15px;color:var(--fg);max-width:62ch}
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(126px,1fr));
+  gap:1px;background:var(--line2)}
+.fact{background:var(--panel2);padding:10px 12px}
+.fact dt{font-size:11px;color:var(--low);margin-bottom:2px}
+.fact dd{font-family:var(--mono);font-size:15px;margin:0}
+
+.agents{display:grid;gap:1px;background:var(--line2);border:1px solid var(--line)}
+.ag{background:var(--panel);padding:13px 16px;display:grid;
+  grid-template-columns:14px 150px 1fr;gap:13px;align-items:start}
+@media(max-width:640px){.ag{grid-template-columns:14px 1fr}.ag .say2{grid-column:2}}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--line);margin-top:8px}
+.ag.live .dot{background:var(--cyan)}
+.ag.stopdot .dot{background:var(--amber)}
+.agname{font-size:14px}
+.agname small{display:block;font-size:11px;color:var(--low);font-family:var(--mono)}
+.ag.live .agname{color:var(--fg)}
+.ag:not(.live) .agname{color:var(--mid)}
+.say2{font-size:13px;color:var(--mid);line-height:1.5}
+.say2 b{color:var(--fg);font-weight:500}
+.chip{display:inline-block;font-family:var(--mono);font-size:11px;padding:1px 6px;
+  border:1px solid var(--line);color:var(--low);margin-left:7px}
+.chip.up{color:var(--amber);border-color:var(--amber)}
+.chip.down{color:var(--cyan);border-color:var(--cyan)}
+
+.rules{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line2);
+  border:1px solid var(--line)}
+@media(max-width:640px){.rules{grid-template-columns:1fr}}
+.rule{background:var(--panel);padding:14px 16px;font-size:13.5px;color:var(--mid)}
+.rule b{display:block;color:var(--fg);font-weight:500;font-size:13px;margin-bottom:3px}
+
+.foot{margin-top:26px;font-size:13px;color:var(--low);max-width:66ch}
+.foot a{color:var(--mid)}
+.err{margin:16px 0;padding:14px 16px;border:1px solid var(--red);background:var(--panel);
+  font-size:14px;display:none}
+.err.on{display:block}
+
+.light{display:flex;gap:16px;align-items:center;background:var(--panel);
+  border:1px solid var(--line);border-left:3px solid var(--low);padding:16px 20px;margin-bottom:14px}
+.light.go{border-left-color:var(--green)}
+.light.wait{border-left-color:var(--amber)}
+.light.no{border-left-color:var(--red)}
+.light .lamp{width:12px;height:12px;border-radius:50%;background:var(--low);flex:none}
+.light.go .lamp{background:var(--green)}
+.light.wait .lamp{background:var(--amber)}
+.light.no .lamp{background:var(--red)}
+.light .txt strong{display:block;font-size:17px;font-weight:500;margin-bottom:2px}
+.light.go .txt strong{color:var(--green)}
+.light.wait .txt strong{color:var(--amber)}
+.light.no .txt strong{color:var(--red)}
+.light .txt span{font-size:13.5px;color:var(--mid)}
+
+table.tgt{width:100%;border-collapse:collapse;font-size:14px}
+table.tgt th{font-size:11px;font-weight:400;color:var(--low);text-align:right;
+  padding:0 12px 8px;border-bottom:1px solid var(--line);letter-spacing:.04em}
+table.tgt th:first-child{text-align:left}
+table.tgt td{padding:9px 12px;text-align:right;border-bottom:1px solid var(--line2);
+  font-family:var(--mono)}
+table.tgt td:first-child{text-align:left}
+table.tgt tr.mid td{background:rgba(79,179,201,.06)}
+.thr{color:var(--green)}
+.dim{color:var(--low)}
+.stakebox{display:flex;align-items:center;gap:10px;margin-bottom:16px;font-size:13px;color:var(--mid)}
+.stakebox input{width:90px;background:var(--bg);border:1px solid var(--line);color:var(--fg);
+  font-family:var(--mono);font-size:15px;padding:7px 10px;border-radius:2px}
+
+.pos{background:var(--panel);border:1px solid var(--line);padding:15px 18px;margin-bottom:1px;
+  display:grid;grid-template-columns:1fr auto;gap:14px;align-items:center}
+.pos.alert{border-color:var(--green);background:rgba(95,179,122,.07)}
+.pos.danger{border-color:var(--red);background:rgba(201,96,90,.07)}
+.pos .who{font-size:15px}
+.pos .who small{display:block;font-family:var(--mono);font-size:12px;color:var(--low);margin-top:2px}
+.pos .act{text-align:right}
+.pos .act b{display:block;font-size:16px;font-weight:500}
+.pos.alert .act b{color:var(--green)}
+.pos.danger .act b{color:var(--red)}
+.pos .act small{font-family:var(--mono);font-size:12px;color:var(--mid)}
+.pos .x{background:none;border:none;color:var(--low);font-size:18px;cursor:pointer;padding:0 4px}
+.pos .x:hover{color:var(--red)}
+.addrow{display:grid;grid-template-columns:1.1fr .8fr .8fr .9fr auto;gap:10px;align-items:end;
+  background:var(--panel);border:1px solid var(--line);padding:15px 18px}
+@media(max-width:700px){.addrow{grid-template-columns:1fr 1fr}}
+.addrow button.add{background:var(--cyan);border:1px solid var(--cyan);color:#0b1014;
+  font:inherit;font-weight:500;font-size:14px;padding:10px 16px;cursor:pointer;border-radius:2px}
+.empty{background:var(--panel);border:1px solid var(--line);padding:16px 18px;
+  font-size:14px;color:var(--mid)}
+.soundrow{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--mid);margin-top:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="bar">
+  <div>
+    <span class="price" id="px">&mdash;</span>
+    <span class="tick" id="conn">connecting</span>
+  </div>
+  <div class="rt">
+    <div class="count" id="clock">--:--<small id="clocklbl">TO CLOSE</small></div>
+  </div>
+</div>
+
+<div class="err" id="err"></div>
+
+<div class="hero">
+  <h3>Where Bitcoin lands when this window closes</h3>
+  <p class="lead" id="lead">Loading&hellip;</p>
+  <canvas id="curve" height="190"></canvas>
+  <div class="axis"><span id="ax1"></span><span id="ax2"></span><span id="ax3"></span></div>
+</div>
+
+<div class="stop" id="stop"></div>
+
+<div class="light" id="light">
+  <span class="lamp"></span>
+  <span class="txt"><strong id="light-t">Checking conditions</strong>
+  <span id="light-s"></span></span>
+</div>
+
+<h2>What to buy &mdash; payout thresholds</h2>
+<div class="panel">
+  <div class="stakebox">
+    <span>If I put in</span>
+    <input type="number" id="tgt-stake" value="20" inputmode="decimal">
+    <span>buy any of these only if Kalshi offers at least the payout shown.</span>
+  </div>
+  <table class="tgt">
+    <thead><tr>
+      <th>Strike</th><th>Yes chance</th><th>Buy Yes above</th>
+      <th>No chance</th><th>Buy No above</th>
+    </tr></thead>
+    <tbody id="targets"></tbody>
+  </table>
+</div>
+
+<h2>Your positions &mdash; when to sell</h2>
+<div id="positions"></div>
+<div class="addrow">
+  <div>
+    <label>Strike</label>
+    <input type="number" id="p-strike" placeholder="76950" inputmode="decimal">
+  </div>
+  <div>
+    <label>Side</label>
+    <div class="seg">
+      <button id="py" class="on">Yes</button>
+      <button id="pn">No</button>
+    </div>
+  </div>
+  <div>
+    <label>Put in $</label>
+    <input type="number" id="p-in" placeholder="20" inputmode="decimal">
+  </div>
+  <div>
+    <label>Pays back $</label>
+    <input type="number" id="p-back" placeholder="48" inputmode="decimal">
+  </div>
+  <button class="add" id="p-add">Track</button>
+</div>
+<div class="soundrow">
+  <input type="checkbox" id="snd"><label for="snd" style="margin:0">Beep when a position needs action</label>
+</div>
+
+<h2>Check a contract</h2>
+<div class="panel">
+  <div class="grid g4">
+    <div>
+      <label>Strike <em>from Kalshi</em></label>
+      <input type="number" id="f-strike" placeholder="76950" inputmode="decimal">
+    </div>
+    <div>
+      <label>You put in <em>dollars</em></label>
+      <input type="number" id="f-in" placeholder="20" inputmode="decimal">
+    </div>
+    <div>
+      <label>You get back <em>if right</em></label>
+      <input type="number" id="f-back" placeholder="57" inputmode="decimal">
+    </div>
+    <div>
+      <label>Side</label>
+      <div class="seg">
+        <button id="sy" class="on">Yes</button>
+        <button id="sn">No</button>
+      </div>
+    </div>
+  </div>
+  <div class="out" id="out">
+    <p class="big" id="big"></p>
+    <p class="say" id="say"></p>
+    <dl class="facts" id="facts"></dl>
+  </div>
+</div>
+
+<h2>Already holding</h2>
+<div class="panel">
+  <div class="grid g4">
+    <div>
+      <label>Strike you bought</label>
+      <input type="number" id="h-strike" placeholder="76950" inputmode="decimal">
+    </div>
+    <div>
+      <label>You put in <em>dollars</em></label>
+      <input type="number" id="h-in" placeholder="20" inputmode="decimal">
+    </div>
+    <div>
+      <label>It pays back <em>if right</em></label>
+      <input type="number" id="h-back" placeholder="48" inputmode="decimal">
+    </div>
+    <div>
+      <label>Side</label>
+      <div class="seg">
+        <button id="hy" class="on">Yes</button>
+        <button id="hn">No</button>
+      </div>
+    </div>
+  </div>
+  <div class="out" id="hout">
+    <p class="big" id="hbig"></p>
+    <p class="say" id="hsay"></p>
+    <dl class="facts" id="hfacts"></dl>
+  </div>
+</div>
+
+<h2>What the agents see</h2>
+<div class="agents" id="agents"></div>
+
+<h2>Rules that hold regardless</h2>
+<div class="rules">
+  <div class="rule"><b>Buy with 8 to 14 minutes left</b>Early enough that the outcome is
+    still open, late enough that the price means something.</div>
+  <div class="rule"><b>Stop opening under 3 minutes</b>Prices are nearly settled. Any
+    edge the numbers claim is noise by then.</div>
+  <div class="rule"><b>Avoid anything near 50&cent;</b>That is where Kalshi's fee peaks,
+    about 3.5% of your stake. A 90&cent; contract costs 0.7%.</div>
+  <div class="rule"><b>Avoid long shots under 15&cent;</b>The fee eats over 6% of your
+    stake, and the model is least reliable out there.</div>
+  <div class="rule"><b>Use limit orders</b>Resting an order costs a quarter of the fee.
+    100 contracts at 50&cent;: $0.44 instead of $1.76.</div>
+  <div class="rule"><b>Sell at 85 to 90&cent;</b>Holding to settlement risks your whole
+    stake to collect the last few cents.</div>
+  <div class="rule"><b>Cut under 20&cent;</b>There is real money left to recover. Holding
+    to zero recovers nothing.</div>
+  <div class="rule"><b>Sit out under 4&cent; of edge</b>Most windows are priced right.
+    Not trading is usually correct.</div>
+</div>
+
+<p class="foot">
+  The curve is where Bitcoin is likely to land, built from how much it has been
+  moving and adjusted by the agents above. Kalshi's prices come from people
+  running similar models, so agreement means you are both probably right.
+  Treat a big disagreement as a reason to find what you are missing, not as free
+  money. <a href="/advanced">Advanced ladder view</a>.
+</p>
+
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+let MK=null,closeAt=null,side='yes',hside='yes';
+
+const nCdf=x=>{const s=x<0?-1:1,ax=Math.abs(x)/Math.SQRT2,t=1/(1+0.3275911*ax);
+  const y=1-((((1.061405429*t-1.453152027)*t+1.421413741)*t-0.284496736)*t+0.254829592)*t*Math.exp(-ax*ax);
+  return 0.5*(1+s*y);};
+const pAbove=(s,k,sg,dr)=>{const c=s*(1+(dr||0)/100);
+  return sg<=0?(c>k?1:0):nCdf(Math.log(c/k)/sg);};
+const orderFee=(p,c,m)=>Math.ceil(Math.round(m*c*p*(1-p)*1e9)/1e9*100)/100;
+const feeC=(p,m)=>orderFee(p,10,m)/10;
+function sizeUp(stake,price,mult){
+  if(price<=0||price>=1||stake<=0)return null;
+  let c=Math.floor(stake/price);
+  while(c>0){
+    const cost=c*price, fee=orderFee(price,c,mult);
+    if(cost+fee<=stake+1e-9)return {contracts:c,cost:cost,fee:fee,total:cost+fee,
+      payout:c,unspent:stake-(cost+fee)};
+    c--;
+  }
+  return null;
+}
+const secs=()=>closeAt?Math.max(0,(closeAt-Date.now())/1000):0;
+const sig=()=>MK?MK.sigma_per_min*Math.sqrt(Math.max(secs()/60,0.0001)):0;
+const usd=n=>'$'+Math.round(n).toLocaleString();
+
+function curve(){
+  if(!MK)return;
+  const cv=$('curve'),ctx=cv.getContext('2d');
+  const dpr=window.devicePixelRatio||1,w=cv.clientWidth,h=190;
+  cv.width=w*dpr;cv.height=h*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+
+  const s=sig(),spot=MK.spot,centre=spot*(1+(MK.drift_pct||0)/100);
+  const move=spot*s,span=move*3.2,lo=centre-span,hi=centre+span;
+  const x=p=>(p-lo)/(hi-lo)*w, base=h-22;
+  const pdf=p=>Math.exp(-0.5*Math.pow(Math.log(p/centre)/s,2));
+
+  const strike=parseFloat($('f-strike').value);
+  const hasK=strike&&strike>lo&&strike<hi;
+
+  // Shade the side that pays, if a strike is set.
+  if(hasK){
+    ctx.beginPath();ctx.moveTo(x(lo),base);
+    for(let i=0;i<=260;i++){const p=lo+(hi-lo)*i/260;ctx.lineTo(x(p),base-pdf(p)*(base-14));}
+    ctx.lineTo(x(hi),base);ctx.closePath();ctx.save();ctx.clip();
+    ctx.fillStyle='rgba(79,179,201,.20)';
+    side==='yes'?ctx.fillRect(x(strike),0,w-x(strike),h):ctx.fillRect(0,0,x(strike),h);
+    ctx.restore();
+  }
+
+  // The distribution itself.
+  ctx.beginPath();ctx.moveTo(x(lo),base);
+  for(let i=0;i<=260;i++){const p=lo+(hi-lo)*i/260;ctx.lineTo(x(p),base-pdf(p)*(base-14));}
+  ctx.lineTo(x(hi),base);ctx.closePath();
+  ctx.fillStyle='rgba(79,179,201,.07)';ctx.fill();
+  ctx.strokeStyle='#4fb3c9';ctx.lineWidth=1.5;
+  ctx.beginPath();
+  for(let i=0;i<=260;i++){const p=lo+(hi-lo)*i/260;const y=base-pdf(p)*(base-14);
+    i?ctx.lineTo(x(p),y):ctx.moveTo(x(p),y);}
+  ctx.stroke();
+
+  ctx.strokeStyle='#252d38';ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(0,base);ctx.lineTo(w,base);ctx.stroke();
+
+  // Now marker.
+  ctx.strokeStyle='rgba(230,234,240,.45)';ctx.setLineDash([2,3]);
+  ctx.beginPath();ctx.moveTo(x(spot),14);ctx.lineTo(x(spot),base);ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle='#8e99a8';ctx.font='11px '+getComputedStyle(document.body).fontFamily;
+  ctx.textAlign='center';ctx.fillText('now',x(spot),10);
+
+  // Strike marker.
+  if(hasK){
+    ctx.strokeStyle='#d9a441';ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.moveTo(x(strike),14);ctx.lineTo(x(strike),base);ctx.stroke();
+    ctx.fillStyle='#d9a441';
+    const lbl=usd(strike), tx=Math.min(Math.max(x(strike),34),w-34);
+    ctx.fillText(lbl,tx,10);
+  }
+
+  $('ax1').textContent=usd(lo);
+  $('ax2').textContent=usd(centre);
+  $('ax3').textContent=usd(hi);
+}
+
+function top(){
+  if(!MK)return;
+  const t=secs(),s=sig(),spot=MK.spot,move=spot*s;
+  $('px').textContent=usd(spot);
+  $('clock').childNodes[0].nodeValue=
+    String(Math.floor(t/60)).padStart(2,'0')+':'+String(Math.floor(t%60)).padStart(2,'0');
+  $('clock').classList.toggle('warn',t<180);
+  $('clocklbl').textContent=t<180?'TOO LATE TO OPEN':'TO CLOSE';
+
+  $('lead').innerHTML='Most likely between <b>'+usd(spot-move)+'</b> and <b>'+
+    usd(spot+move)+'</b> &mdash; a swing of about '+usd(move)+' either way.';
+
+  const st=$('stop');
+  const stoppers=(MK.agents||[]).filter(a=>a.suppress);
+  if(stoppers.length){
+    st.innerHTML='<b>Do not trade this window.</b> '+stoppers.map(a=>a.detail).join(' ');
+    st.classList.add('on');
+  } else st.classList.remove('on');
+
+  curve();
+}
+
+function agents(){
+  if(!MK||!MK.agents)return;
+  $('agents').innerHTML=MK.agents.map(a=>{
+    const vm=a.vol_multiplier,chip=
+      a.suppress?'<span class="chip up">stop</span>':
+      vm>1.02?'<span class="chip up">wider '+Math.round((vm-1)*100)+'%</span>':
+      vm<0.98?'<span class="chip down">tighter '+Math.round((1-vm)*100)+'%</span>':'';
+    const cls='ag'+(a.active?' live':'')+(a.suppress?' stopdot':'');
+    const nm=a.agent.replace(/_/g,' ');
+    return '<div class="'+cls+'"><span class="dot"></span>'+
+      '<span class="agname">'+nm+chip+'<small>'+a.evidence+'</small></span>'+
+      '<span class="say2"><b>'+a.headline+'.</b> '+a.detail+'</span></div>';
+  }).join('');
+}
+
+function check(){
+  const k=parseFloat($('f-strike').value);
+  const stake=parseFloat($('f-in').value);
+  const back=parseFloat($('f-back').value);
+  const box=$('out');
+  if(!MK||!k||!stake||!back||back<=stake){box.classList.remove('on');curve();return;}
+  box.classList.add('on');
+
+  // Kalshi shows dollars in and dollars back. The implied price per dollar of
+  // payout is simply stake/back - that IS the market's probability.
+  const price=stake/back;
+  const t=secs(),s=sig(),spot=MK.spot;
+  const py=pAbove(spot,k,s,MK.drift_pct);
+  const fair=side==='yes'?py:1-py;
+
+  // Contracts are payout dollars; the fee is charged per contract.
+  const contracts=back;
+  const f=feeC(price,MK.taker_multiplier);
+  const totalFee=f*contracts;
+  const evPerDollar=fair-price-f;
+  const evTotal=evPerDollar*contracts;
+  const fairBack=fair>0?stake/fair:0;
+  const sd=s>0?Math.abs(Math.log(spot/k)/s):0;
+  const pc=(price*100).toFixed(0), fc=(fair*100).toFixed(0);
+
+  let cls,big,say;
+  if(MK.suppressed){
+    cls='risky';big='Not now';
+    say='An agent has flagged conditions as unreliable. Whatever this looks like on '+
+      'paper, the numbers behind it cannot be trusted right now.';
+  } else if(sd>=2){
+    cls='risky';big='Too far out';
+    say='Bitcoin would need to travel '+usd(Math.abs(spot-k))+' in '+Math.ceil(t/60)+
+      ' minutes. Real Bitcoin jumps more often than this model expects, so out here it '+
+      'understates the odds. Skip it even if it looks cheap.';
+  } else if(t<180){
+    cls='risky';big='Too late to open';
+    say='Under three minutes. Prices are nearly settled and any advantage the numbers '+
+      'suggest is noise. Wait for the next window.';
+  } else if(evPerDollar>=0.04){
+    cls='good';big='Good deal';
+    say='Kalshi is offering $'+back.toFixed(2)+' back on your $'+stake.toFixed(2)+'. '+
+      'For a fair bet at these odds you should be getting about $'+fairBack.toFixed(2)+
+      ' back, so they are paying you more than the risk is worth. Use a limit order '+
+      'rather than market \u2014 it cuts the fee roughly fourfold.';
+    if(Math.abs(price-0.5)<0.08)say+=' Note the fee peaks near even odds, so the edge has to be bigger here.';
+    else if(price<0.15)say+=' Note the fee is over 6% of your stake at these long odds.';
+  } else if(evPerDollar<=-0.04){
+    cls='bad';big='Bad deal';
+    say='Kalshi is offering $'+back.toFixed(2)+' back on your $'+stake.toFixed(2)+
+      '. For the risk you are taking you should be getting about $'+fairBack.toFixed(2)+
+      ' back. You are being underpaid. Check the other side \u2014 it may be the good one.';
+  } else {
+    cls='meh';big='Fair deal, no edge';
+    say='Kalshi offers $'+back.toFixed(2)+' back and a fair bet would pay about $'+
+      fairBack.toFixed(2)+'. That gap is inside the model\u2019s own margin of error. '+
+      'Most windows look like this.';
+  }
+
+  box.className='out on '+cls;
+  $('big').textContent=big;$('say').textContent=say;
+  $('facts').innerHTML=
+    '<div class="fact"><dt>Needs BTC</dt><dd>'+(side==='yes'?'above ':'below ')+usd(k)+'</dd></div>'+
+    '<div class="fact"><dt>Distance</dt><dd>'+usd(Math.abs(spot-k))+'</dd></div>'+
+    '<div class="fact"><dt>Chance of that</dt><dd>'+fc+'%</dd></div>'+
+    '<div class="fact"><dt>Kalshi implies</dt><dd>'+pc+'%</dd></div>'+
+    '<div class="fact"><dt>Fair payout</dt><dd>$'+fairBack.toFixed(2)+'</dd></div>'+
+    '<div class="fact"><dt>Fee</dt><dd>$'+totalFee.toFixed(2)+'</dd></div>'+
+    '<div class="fact"><dt>Expected</dt><dd>'+(evTotal>=0?'+':'')+'$'+evTotal.toFixed(2)+'</dd></div>'+
+    '<div class="fact"><dt>Risking</dt><dd>$'+stake.toFixed(2)+'</dd></div>';
+  curve();
+}
+
+function held(){
+  const k=parseFloat($('h-strike').value);
+  const stake=parseFloat($('h-in').value);
+  const back=parseFloat($('h-back').value);
+  const box=$('hout');
+  if(!MK||!k||!stake||!back||back<=stake){box.classList.remove('on');return;}
+  box.classList.add('on');
+
+  const paid=stake/back;              // what you effectively paid per dollar
+  const contracts=back;               // payout dollars you hold
+  const t=secs(),s=sig(),spot=MK.spot;
+  const py=pAbove(spot,k,s,MK.drift_pct);
+  const now=hside==='yes'?py:1-py;
+  const worth=now*contracts;          // sellable value of the position
+  const pl=worth-stake;
+  const nc=(now*100).toFixed(0);
+
+  let cls,big,say;
+  if(now>=0.85){
+    cls='good';big='Take the profit';
+    say='Your position is worth about $'+worth.toFixed(2)+' now against the $'+
+      stake.toFixed(2)+' you put in. Selling locks in $'+pl.toFixed(2)+'. Holding to '+
+      'the close risks the whole $'+worth.toFixed(2)+' to collect the last $'+
+      (back-worth).toFixed(2)+'. That is a bad bet at this point.';
+  } else if(now<=0.20){
+    cls='bad';big='Cut it';
+    say='Your position has fallen to about $'+worth.toFixed(2)+' from the $'+
+      stake.toFixed(2)+' you put in. Bitcoin moved against you with little time to '+
+      'recover. Selling gets $'+worth.toFixed(2)+' back; holding to the close most '+
+      'likely gets nothing.';
+  } else if(t<120){
+    cls='meh';big='Too late to act';
+    say='Under two minutes, worth around $'+worth.toFixed(2)+'. Selling into a thin '+
+      'book this late usually costs more than it saves. Let it settle.';
+  } else if(pl>0.10*stake){
+    cls='good';big='Winning \u2014 pick your exit';
+    say='Worth about $'+worth.toFixed(2)+' against $'+stake.toFixed(2)+' in, so you are '+
+      'up $'+pl.toFixed(2)+'. Set a sell once it reaches roughly $'+(0.87*back).toFixed(2)+
+      ', or take some off now. Do not drift into the close undecided.';
+  } else if(pl<-0.10*stake){
+    cls='risky';big='Losing \u2014 set a floor';
+    say='Worth about $'+worth.toFixed(2)+' against $'+stake.toFixed(2)+' in, down $'+
+      Math.abs(pl).toFixed(2)+'. Decide your exit now rather than in the last minute. '+
+      'Around $'+(0.20*back).toFixed(2)+' is a sensible floor.';
+  } else {
+    cls='meh';big='About where you started';
+    say='Worth about $'+worth.toFixed(2)+' against $'+stake.toFixed(2)+' in. Little has '+
+      'changed. Hold, but know in advance where you take profit and where you cut.';
+  }
+
+  box.className='out on '+cls;
+  $('hbig').textContent=big;$('hsay').textContent=say;
+  $('hfacts').innerHTML=
+    '<div class="fact"><dt>You put in</dt><dd>$'+stake.toFixed(2)+'</dd></div>'+
+    '<div class="fact"><dt>Worth now</dt><dd>$'+worth.toFixed(2)+'</dd></div>'+
+    '<div class="fact"><dt>Up / down</dt><dd>'+(pl>=0?'+':'')+'$'+pl.toFixed(2)+'</dd></div>'+
+    '<div class="fact"><dt>Chance of winning</dt><dd>'+nc+'%</dd></div>'+
+    '<div class="fact"><dt>Pays if right</dt><dd>$'+back.toFixed(2)+'</dd></div>'+
+    '<div class="fact"><dt>Time left</dt><dd>'+Math.floor(t/60)+'m '+Math.floor(t%60)+'s</dd></div>';
+}
+
+function seg(a,b,set){
+  $(a).onclick=function(){set(1);$(a).classList.add('on');$(b).classList.remove('on');};
+  $(b).onclick=function(){set(0);$(b).classList.add('on');$(a).classList.remove('on');};
+}
+seg('sy','sn',v=>{side=v?'yes':'no';check();});
+seg('hy','hn',v=>{hside=v?'yes':'no';held();});
+['f-strike','f-in','f-back'].forEach(i=>$(i).addEventListener('input',check));
+['h-strike','h-in','h-back'].forEach(i=>$(i).addEventListener('input',held));
+
+
+// ---- readiness light -------------------------------------------------
+function light(){
+  if(!MK)return;
+  const t=secs(), el=$('light');
+  const stops=(MK.agents||[]).filter(a=>a.suppress);
+  let cls,title,sub;
+
+  if(stops.length){
+    cls='no';title='Do not trade this window';
+    sub=stops.map(a=>a.headline).join('. ')+'. Conditions are not readable right now.';
+  } else if(t<180){
+    cls='no';title='Too late to open anything';
+    sub='Under three minutes. Manage what you hold, then wait for the next window.';
+  } else if(t>780){
+    cls='wait';title='Wait a few minutes';
+    sub='More than 13 minutes out. Prices this early are thin and move a lot. '+
+      'Come back when the clock reads around 12.';
+  } else if(MK.disagreement!=null&&MK.disagreement>0.5){
+    cls='wait';title='Conditions are murky';
+    sub='The volatility measures disagree by '+Math.round(MK.disagreement*100)+
+      '%. Only act on a large, obvious mispricing.';
+  } else {
+    cls='go';title='Good time to be looking';
+    sub='Clock is in the useful range and nothing is flagged. Compare Kalshi\u2019s '+
+      'payouts against the thresholds below.';
+  }
+  el.className='light '+cls;
+  $('light-t').textContent=title;
+  $('light-s').textContent=sub;
+}
+
+// ---- payout thresholds -----------------------------------------------
+// Given a real probability p, find the smallest payout that still leaves a
+// worthwhile edge after fees. The fee depends on the price, which depends on
+// the payout, so solve by fixed-point iteration - it converges in a few passes.
+function minPayout(p,stake,mult,edge){
+  if(p<=edge+0.02)return null;
+  // The fee rounds to the cent, which makes the iteration settle into a
+  // two-value cycle on some inputs. Keeping the lowest price seen is both
+  // stable and the conservative choice - it demands the larger payout.
+  let price=p-edge, lowest=price;
+  for(let i=0;i<8;i++){
+    price=p-edge-feeC(price,mult);
+    if(price<lowest)lowest=price;
+  }
+  if(lowest<=0.01)return null;
+  return stake/lowest;
+}
+
+function targets(){
+  if(!MK)return;
+  const stake=parseFloat($('tgt-stake').value)||20;
+  const s=sig(),spot=MK.spot,t=secs();
+  const step=Math.max(Math.round(spot*s*0.6/10)*10,10);
+  const rows=[];
+  for(let i=3;i>=-3;i--){
+    const k=Math.round((spot+i*step)/10)*10;
+    const py=pAbove(spot,k,s,MK.drift_pct);
+    const sd=s>0?Math.abs(Math.log(spot/k)/s):0;
+    const far=sd>=2;
+    const mkCell=prob=>{
+      if(far)return '<td class="dim">too far out</td>';
+      const need=minPayout(prob,stake,MK.taker_multiplier,0.04);
+      return need?'<td class="thr">$'+need.toFixed(2)+'</td>':'<td class="dim">not worth it</td>';
+    };
+    rows.push('<tr class="'+(Math.abs(k-spot)<step/2?'mid':'')+'">'+
+      '<td>'+usd(k)+'</td>'+
+      '<td>'+(py*100).toFixed(0)+'%</td>'+mkCell(py)+
+      '<td>'+((1-py)*100).toFixed(0)+'%</td>'+mkCell(1-py)+'</tr>');
+  }
+  $('targets').innerHTML=rows.join('');
+}
+
+// ---- position monitor ------------------------------------------------
+let POS=[];
+try{POS=JSON.parse(localStorage.getItem('kalshi_positions')||'[]');}catch(e){POS=[];}
+const savePos=()=>{try{localStorage.setItem('kalshi_positions',JSON.stringify(POS));}catch(e){}};
+let pside='yes', lastAlert={};
+
+function beep(){
+  if(!$('snd').checked)return;
+  try{
+    const a=new (window.AudioContext||window.webkitAudioContext)();
+    const o=a.createOscillator(),g=a.createGain();
+    o.connect(g);g.connect(a.destination);o.frequency.value=660;
+    g.gain.setValueAtTime(0.14,a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001,a.currentTime+0.3);
+    o.start();o.stop(a.currentTime+0.3);
+  }catch(e){}
+}
+
+function positions(){
+  const box=$('positions');
+  if(!POS.length){
+    box.innerHTML='<div class="empty">Nothing tracked. Add a position below and '+
+      'this will watch it and tell you when to sell.</div>';
+    return;
+  }
+  if(!MK){box.innerHTML='';return;}
+
+  const t=secs(),s=sig(),spot=MK.spot;
+  box.innerHTML=POS.map((q,i)=>{
+    const py=pAbove(spot,q.k,s,MK.drift_pct);
+    const chance=q.side==='yes'?py:1-py;
+    const worth=chance*q.back;
+    const pl=worth-q.stake;
+
+    let cls='',act,note;
+    if(chance>=0.85){
+      cls='alert';act='Sell now';
+      note='worth $'+worth.toFixed(2)+', locks in $'+pl.toFixed(2);
+    } else if(chance<=0.20){
+      cls='danger';act='Cut it';
+      note='worth $'+worth.toFixed(2)+', recovers what is left';
+    } else if(t<120){
+      act='Let it settle';note='too late to sell well';
+    } else if(pl>0){
+      act='Hold';note='up $'+pl.toFixed(2)+', sell near $'+(0.87*q.back).toFixed(2);
+    } else {
+      act='Hold';note='down $'+Math.abs(pl).toFixed(2)+', floor at $'+(0.20*q.back).toFixed(2);
+    }
+
+    const key=i+':'+cls;
+    if((cls==='alert'||cls==='danger')&&lastAlert[i]!==cls){lastAlert[i]=cls;beep();}
+    if(cls==='')delete lastAlert[i];
+
+    return '<div class="pos '+cls+'">'+
+      '<span class="who">'+(q.side==='yes'?'Yes above ':'No below ')+usd(q.k)+
+      '<small>$'+q.stake.toFixed(2)+' in, pays $'+q.back.toFixed(2)+
+      ' &middot; '+(chance*100).toFixed(0)+'% chance</small></span>'+
+      '<span class="act"><b>'+act+'</b><small>'+note+'</small></span>'+
+      '<button class="x" data-i="'+i+'" title="stop tracking">&times;</button></div>';
+  }).join('');
+
+  box.querySelectorAll('.x').forEach(b=>b.onclick=()=>{
+    POS.splice(parseInt(b.dataset.i),1);lastAlert={};savePos();positions();});
+}
+
+$('py').onclick=function(){pside='yes';$('py').classList.add('on');$('pn').classList.remove('on');};
+$('pn').onclick=function(){pside='no';$('pn').classList.add('on');$('py').classList.remove('on');};
+$('p-add').onclick=function(){
+  const k=parseFloat($('p-strike').value),st=parseFloat($('p-in').value),bk=parseFloat($('p-back').value);
+  if(!k||!st||!bk||bk<=st){alert('Fill in strike, what you put in, and what it pays back.');return;}
+  POS.push({k:k,side:pside,stake:st,back:bk});savePos();
+  $('p-strike').value='';$('p-in').value='';$('p-back').value='';
+  positions();
+};
+$('tgt-stake').addEventListener('input',targets);
+
+function all(){top();check();held();light();targets();positions();}
+
+async function poll(){
+  try{
+    const d=await(await fetch('/api/market')).json();
+    if(!d.ok){$('err').textContent='Price feed not responding: '+(d.error||'');
+      $('err').classList.add('on');$('conn').textContent='feed down';return;}
+    $('err').classList.remove('on');
+    MK=d;closeAt=new Date(d.window_close);
+    $('conn').textContent=d.stale?'cached':'live';
+    agents();all();
+  }catch(e){
+    $('err').textContent='Cannot reach the local server. Is the black window still open?';
+    $('err').classList.add('on');$('conn').textContent='disconnected';
+  }
+}
+poll();setInterval(poll,15000);setInterval(all,1000);
+window.addEventListener('resize',curve);
+</script>
+</body>
+</html>
