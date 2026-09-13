@@ -46,10 +46,29 @@ python score.py --no-drift       # re-price with the drift term removed
 python score.py --by-horizon     # T-12 vs T-8 vs T-4
 python learn.py                  # fit a calibration correction
 python learn.py --agents         # which adjusters help, which hurt
-python -m unittest discover -p "test_*.py"    # 158 tests
+python replay.py                 # what would trading it have made?
+python replay.py --fill mid      # optimistic fills
+python -m unittest discover -p "test_*.py"    # 174 tests
 ```
 
 The logger needs no Kalshi account. Market data is public and read-only.
+
+## Replay
+
+`replay.py` turns the log into a P&L. For every reading with a recorded
+book, it decides whether the model would have traded, on which side, at what
+price, and settles it against the outcome with Kalshi's real fee.
+
+It sweeps the entry threshold - minimum model-vs-book gap before trading -
+because a model that loses on average might still win where it disagrees
+most. The threshold is chosen on the first 60% of windows and P&L is
+reported on the last 40%. **Only the held-out number counts.** Choosing and
+reporting on the same data is the overfitting that rejected the calibration
+fit.
+
+Two fill modes: `ask` (pay the ask, realistic) and `mid` (optimistic). Every
+book logged so far had volume 0, so whether anything fills is unknown. If the
+sign flips between modes, liquidity is the whole story.
 
 ## Reading the score
 
@@ -80,6 +99,7 @@ core/
 logger.py          Records predictions + book. The important one.
 score.py           Scores the log against reality and against the book
 learn.py           Fits corrections, refuses them when they don't validate
+replay.py          Replays the log as trades. Dollars, fees, holdout.
 kalshi_book.py     Inspect the current Kalshi book
 ```
 

@@ -114,9 +114,11 @@ def load(path: Path, zero_drift: bool = False):
                     "drift_pct": p.get("drift_pct", 0.0),
                     "agents": p.get("agents") or {},
                     "mkt_p": mkt.get("implied_p_above"),
+                    "yes_direction": mkt.get("yes_direction", "above"),
                     "yes_bid": mkt.get("yes_bid"),
                     "yes_ask": mkt.get("yes_ask"),
                     "no_ask": mkt.get("no_ask"),
+                    "no_bid": mkt.get("no_bid"),
                     "ticker": mkt.get("ticker"),
                 }
             )

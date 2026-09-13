@@ -46,12 +46,14 @@ Every threshold on the dashboard depends on it.
 | `python score.py` | calibrated? and does it beat the market? |
 | `python score.py --no-drift` | same, with the drift term removed |
 | `python score.py --by-horizon` | is it better at 12 min or 4 min? |
+| `python replay.py` | what would trading it have made, in dollars? |
+| `python replay.py --fill mid` | same, optimistic fills |
 | `python logger.py --no-market` | log without Kalshi (calibration only) |
 | `python kalshi_price.py --table` | fair value by strike, terminal only |
 | `python learn.py` | fit a correction from the log |
 | `python learn.py --agents` | which agents actually help |
 | `python learn.py --apply` | save the correction, if it validates |
-| `python -m unittest discover -p "test_*.py"` | 155 tests |
+| `python -m unittest discover -p "test_*.py"` | 174 tests |
 
 Older spot-trading build, different instrument, kept for reference:
 `server.py`, `run.py`, `simulate.py`.
