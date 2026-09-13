@@ -301,9 +301,28 @@ def report(rows, fill: str, contracts: int, fees: KalshiFees,
         elif te.gross < 0:
             print("  Gross negative: the model is losing before fees are counted.")
             print("  Cheaper execution would not fix this.")
+        elif abs(te.roi) < 3.0:
+            print("  Breakeven within noise. This is not a result either way.")
         elif te.net > 0:
             print("  Net positive on held-out data. Worth checking it survives")
             print("  --fill ask if you ran --fill mid, and a longer sample.")
+
+    # ---- did the two periods agree? --------------------------------------
+    tr_sign = [x[1].net > 0 for x in results if x[1].n >= 5]
+    te_sign = [x[2].net > 0 for x in results if x[2].n >= 5]
+    if tr_sign and te_sign and (all(not s for s in tr_sign) != all(not s for s in te_sign)):
+        print()
+        print("  WARNING: the choosing period and the reporting period disagree")
+        print("  on sign at nearly every threshold. The market changed character")
+        print("  between them. No single number here is trustworthy yet.")
+
+    # ---- confidence vs accuracy ------------------------------------------
+    wr = [(x[0], x[2].win_rate) for x in results if x[2].n >= 8]
+    if len(wr) >= 5 and all(b[1] <= a[1] for a, b in zip(wr, wr[1:])):
+        print()
+        print("  Win rate falls as claimed edge rises, at every threshold. The")
+        print("  more the model disagrees with the book, the more often the book")
+        print("  is right. Strong disagreement is a signal the MODEL is wrong.")
 
     # ---- by horizon ------------------------------------------------------
     if horizon is None:
