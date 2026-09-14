@@ -258,3 +258,223 @@ class CredentialsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class V2OrderShapeTest(unittest.TestCase):
+    """
+    The V2 endpoint quotes the YES leg only. Getting the translation
+    backwards would buy the opposite of what was intended at a
+    plausible-looking price, and nothing would raise.
+    """
+
+    def test_buy_yes_is_a_bid_at_the_same_price(self):
+        from core.kalshi_exec import to_v2
+        self.assertEqual(to_v2("yes", "buy", 23), ("bid", 23))
+
+    def test_sell_yes_is_an_ask_at_the_same_price(self):
+        from core.kalshi_exec import to_v2
+        self.assertEqual(to_v2("yes", "sell", 23), ("ask", 23))
+
+    def test_buy_no_is_an_ask_at_the_complement(self):
+        from core.kalshi_exec import to_v2
+        self.assertEqual(to_v2("no", "buy", 23), ("ask", 77))
+
+    def test_sell_no_is_a_bid_at_the_complement(self):
+        from core.kalshi_exec import to_v2
+        self.assertEqual(to_v2("no", "sell", 23), ("bid", 77))
+
+    def test_complement_round_trips(self):
+        from core.kalshi_exec import to_v2
+        for p in range(1, 100):
+            _, yes_p = to_v2("no", "buy", p)
+            self.assertEqual(yes_p, 100 - p)
+
+    def test_order_path_is_the_v2_endpoint(self):
+        from pathlib import Path
+        import core.kalshi_exec as ke
+        src = Path(ke.__file__).read_text()
+        self.assertIn("/trade-api/v2/portfolio/events/orders", src)
+
+    def test_count_and_price_are_fixed_point_strings(self):
+        """V2 rejects integer cents; count and price must be dollar strings."""
+        sent = {}
+
+        class FakeClient(ke_module.DemoClient):
+            def __init__(self):
+                self.base = "https://demo-api.kalshi.co/trade-api/v2"
+                self.key_id = "k"
+                self._key = None
+
+            def _request(self, method, path, body=None, query=None):
+                sent["method"], sent["path"], sent["body"] = method, path, body
+                return {}
+
+        FakeClient().place_limit(
+            ticker="T", side="yes", action="buy", count=2,
+            price_cents=23, client_order_id="cid",
+        )
+        self.assertEqual(sent["path"], "/trade-api/v2/portfolio/events/orders")
+        self.assertEqual(sent["body"]["count"], "2.00")
+        self.assertEqual(sent["body"]["price"], "0.2300")
+        self.assertEqual(sent["body"]["side"], "bid")
+        self.assertEqual(sent["body"]["time_in_force"], "good_till_canceled")
+        self.assertEqual(
+            sent["body"]["self_trade_prevention_type"], "taker_at_cross"
+        )
+
+    def test_buying_no_sends_the_complement_price(self):
+        sent = {}
+
+        class FakeClient(ke_module.DemoClient):
+            def __init__(self):
+                self.base = "x"
+                self.key_id = "k"
+                self._key = None
+
+            def _request(self, method, path, body=None, query=None):
+                sent["body"] = body
+                return {}
+
+        FakeClient().place_limit(
+            ticker="T", side="no", action="buy", count=1,
+            price_cents=23, client_order_id="cid",
+        )
+        self.assertEqual(sent["body"]["side"], "ask")
+        self.assertEqual(sent["body"]["price"], "0.7700")
+
+    def test_bad_time_in_force_is_rejected(self):
+        import core.kalshi_exec as ke
+
+        class FakeClient(ke.DemoClient):
+            def __init__(self):
+                self.base = "x"
+                self.key_id = "k"
+                self._key = None
+
+        with self.assertRaises(ke.KalshiError):
+            FakeClient().place_limit(
+                ticker="T", side="yes", action="buy", count=1,
+                price_cents=23, client_order_id="c", time_in_force="GTT",
+            )
+
+
+import core.kalshi_exec as ke_module  # noqa: E402
+
+
+class ShardRoutingTest(unittest.TestCase):
+    """
+    Collateral is per shard and does not follow the order. Getting the
+    centicent conversion or the routing index wrong produces a rejection
+    that reads exactly like having no money.
+    """
+
+    def test_dollars_to_centicents(self):
+        from core.kalshi_exec import to_centicents
+        self.assertEqual(to_centicents(1.00), 10000)
+        self.assertEqual(to_centicents(0.01), 100)
+        self.assertEqual(to_centicents(15.00), 150000)
+        self.assertEqual(to_centicents(20.0), 200000)
+
+    def test_centicents_rounds_rather_than_truncates(self):
+        from core.kalshi_exec import to_centicents
+        self.assertEqual(to_centicents(0.0001), 1)
+        self.assertEqual(to_centicents(1.2345), 12345)
+
+    def test_transfer_body_shape(self):
+        sent = {}
+
+        class FakeClient(ke_module.DemoClient):
+            def __init__(self):
+                self.base = "x"
+                self.key_id = "k"
+                self._key = None
+
+            def _request(self, method, path, body=None, query=None):
+                sent["path"], sent["body"] = path, body
+                return {"transfer_id": "t1"}
+
+        FakeClient().transfer(dollars=15.0, src_shard=0, dst_shard=2)
+        self.assertEqual(
+            sent["path"],
+            "/trade-api/v2/portfolio/intra_exchange_instance_transfer",
+        )
+        self.assertEqual(sent["body"]["amount"], 150000)
+        self.assertEqual(sent["body"]["source_exchange_shard"], 0)
+        self.assertEqual(sent["body"]["destination_exchange_shard"], 2)
+        self.assertEqual(sent["body"]["source"], "event_contract")
+        self.assertEqual(sent["body"]["destination"], "event_contract")
+
+    def test_transfer_rejects_non_positive(self):
+        import core.kalshi_exec as ke
+
+        class FakeClient(ke.DemoClient):
+            def __init__(self):
+                self.base = "x"
+                self.key_id = "k"
+                self._key = None
+
+        for bad in (0, -5.0):
+            with self.assertRaises(ke.KalshiError):
+                FakeClient().transfer(dollars=bad, src_shard=0, dst_shard=2)
+
+    def test_exchange_index_is_sent_on_the_order(self):
+        sent = {}
+
+        class FakeClient(ke_module.DemoClient):
+            def __init__(self):
+                self.base = "x"
+                self.key_id = "k"
+                self._key = None
+
+            def _request(self, method, path, body=None, query=None):
+                sent["body"] = body
+                return {}
+
+        FakeClient().place_limit(
+            ticker="T", side="yes", action="buy", count=1, price_cents=50,
+            client_order_id="c", exchange_index=2,
+        )
+        self.assertEqual(sent["body"]["exchange_index"], 2)
+
+    def test_exchange_index_omitted_when_not_known(self):
+        sent = {}
+
+        class FakeClient(ke_module.DemoClient):
+            def __init__(self):
+                self.base = "x"
+                self.key_id = "k"
+                self._key = None
+
+            def _request(self, method, path, body=None, query=None):
+                sent["body"] = body
+                return {}
+
+        FakeClient().place_limit(
+            ticker="T", side="yes", action="buy", count=1, price_cents=50,
+            client_order_id="c",
+        )
+        self.assertNotIn("exchange_index", sent["body"])
+
+    def test_exchange_index_read_off_the_market(self):
+        class FakeClient(ke_module.DemoClient):
+            def __init__(self):
+                self.base = "x"
+                self.key_id = "k"
+                self._key = None
+
+            def _request(self, method, path, body=None, query=None):
+                return {"market": {"ticker": "T", "exchange_index": 2}}
+
+        self.assertEqual(FakeClient().exchange_index_for("T"), 2)
+
+    def test_shard_zero_is_a_real_answer_not_a_missing_one(self):
+        class FakeClient(ke_module.DemoClient):
+            def __init__(self):
+                self.base = "x"
+                self.key_id = "k"
+                self._key = None
+
+            def _request(self, method, path, body=None, query=None):
+                return {"market": {"exchange_index": 0}}
+
+        self.assertEqual(FakeClient().exchange_index_for("T"), 0)

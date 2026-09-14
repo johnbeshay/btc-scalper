@@ -43,7 +43,7 @@ from core.kalshi_auth import SigningError, auth_headers, load_private_key
 
 # --- the line between practice and money ----------------------------------
 BASE = "https://external-api.demo.kalshi.co/trade-api/v2"
-# Production is https://api.elections.kalshi.com/trade-api/v2
+# Production is https://external-api.kalshi.com/trade-api/v2
 # Read the module docstring before you change this.
 # --------------------------------------------------------------------------
 
@@ -53,6 +53,35 @@ TIMEOUT = 15
 
 class KalshiError(RuntimeError):
     """An API call failed."""
+
+
+def to_centicents(dollars: float) -> int:
+    """
+    Dollars to centicents (hundredths of a cent). $1.00 -> 10000.
+
+    Kalshi's transfer endpoint is the only place in this codebase using this
+    unit; everywhere else is cents or dollars. One conversion, one test.
+    """
+    return int(round(dollars * 10000))
+
+
+def to_v2(side: str, action: str, price_cents: int) -> tuple[str, int]:
+    """
+    Translate yes/no + buy/sell into the V2 single-book form.
+
+    V2 quotes the YES leg only, so NO exposure becomes the opposite action
+    on YES at the complement price:
+
+        buy  yes  ->  bid at p
+        sell yes  ->  ask at p
+        buy  no   ->  ask at 100 - p    (buying NO at p == selling YES at 1-p)
+        sell no   ->  bid at 100 - p
+
+    Returns (book_side, yes_price_cents).
+    """
+    if side == "yes":
+        return ("bid" if action == "buy" else "ask", price_cents)
+    return ("ask" if action == "buy" else "bid", 100 - price_cents)
 
 
 @dataclass
@@ -184,6 +213,50 @@ class DemoClient:
             "GET", "/trade-api/v2/portfolio/settlements", query={"limit": limit}
         )
 
+    def market(self, ticker: str) -> dict:
+        """
+        One market. Carries `exchange_index`, which the docs call the
+        authoritative source of truth for routing - read it off the market
+        rather than inferring it from the category.
+        """
+        return self._request("GET", f"/trade-api/v2/markets/{ticker}")
+
+    def exchange_index_for(self, ticker: str) -> int | None:
+        m = self.market(ticker)
+        return (m.get("market", m) or {}).get("exchange_index")
+
+    def transfer(self, *, dollars: float, src_shard: int, dst_shard: int,
+                 instance: str = "event_contract") -> dict:
+        """
+        Move collateral between exchange shards.
+
+        Collateral does not follow an order. Funds on shard 0 cannot back an
+        order routed to shard 2; the rejection is `insufficient_shard_balance`
+        and reads identically to having no money at all.
+
+        `amount` is in CENTICENTS - one hundredth of a cent. $1.00 is 10,000.
+        Getting this wrong by a factor of 100 is the obvious failure here, so
+        the conversion happens in one place and is tested.
+
+        Kalshi warns that cross-shard transfers run in up to three non-atomic
+        steps and that completed steps are not rolled back if a later one
+        fails, which can strand funds on either side. Check the balance
+        breakdown after every transfer rather than assuming it landed.
+        """
+        if dollars <= 0:
+            raise KalshiError(f"amount must be positive, got {dollars}")
+        body = {
+            "source": instance,
+            "destination": instance,
+            "amount": to_centicents(dollars),
+            "source_exchange_shard": src_shard,
+            "destination_exchange_shard": dst_shard,
+        }
+        return self._request(
+            "POST", "/trade-api/v2/portfolio/intra_exchange_instance_transfer",
+            body,
+        )
+
     def whoami(self) -> dict:
         """Cheapest call that proves auth works end to end."""
         return self.balance()
@@ -192,9 +265,29 @@ class DemoClient:
 
     def place_limit(self, *, ticker: str, side: str, action: str,
                     count: int, price_cents: int,
-                    client_order_id: str) -> dict:
+                    client_order_id: str,
+                    time_in_force: str = "good_till_canceled",
+                    exchange_index: int | None = None) -> dict:
         """
-        One limit order.
+        One limit order, via the V2 endpoint.
+
+        THE V2 SHAPE
+        ------------
+        V2 quotes everything from the YES leg. `side` is bid or ask:
+
+            bid  = buy YES
+            ask  = sell YES
+
+        and selling YES is economically the same as buying NO at 1 - price.
+        So a NO position is expressed as an ask on YES at the complement
+        price. `to_v2()` below does that translation and is tested on all
+        four combinations, because getting it backwards buys the opposite
+        of what you meant at a plausible-looking price - a mistake that
+        would not raise anything.
+
+        Count and price are fixed-point STRINGS in dollars, not integer
+        cents: "1.00" and "0.23". Sending ints here is accepted by json and
+        rejected by the exchange.
 
         Limit only, never market. A market order on a book with no depth -
         and KXBTC15M has shown zero volume every time it has been checked -
@@ -208,19 +301,35 @@ class DemoClient:
             raise KalshiError(f"price must be 1-99 cents, got {price_cents}")
         if count < 1:
             raise KalshiError(f"count must be >= 1, got {count}")
+        if time_in_force not in ("fill_or_kill", "good_till_canceled",
+                                 "immediate_or_cancel"):
+            raise KalshiError(f"bad time_in_force: {time_in_force!r}")
+
+        book_side, yes_price_cents = to_v2(side, action, price_cents)
 
         body = {
             "ticker": ticker,
             "client_order_id": client_order_id,
-            "side": side,
-            "action": action,
-            "count": count,
-            "type": "limit",
-            f"{side}_price": price_cents,
+            "side": book_side,
+            "count": f"{count}.00",
+            "price": f"{yes_price_cents / 100:.4f}",
+            "time_in_force": time_in_force,
+            "self_trade_prevention_type": "taker_at_cross",
         }
-        return self._request("POST", "/trade-api/v2/portfolio/orders", body)
+        if exchange_index is not None:
+            body["exchange_index"] = exchange_index
+        return self._request("POST", "/trade-api/v2/portfolio/events/orders", body)
 
     def cancel(self, order_id: str) -> dict:
+        """
+        Cancel a resting order.
+
+        NOTE: this is still the V1 path. The V2 migration notice named the
+        create endpoint specifically; whether cancel moved too has not been
+        confirmed against the API. If this returns HTTP 410 with a
+        deprecated_v1 code, the same migration applies here and the path
+        needs updating - do not assume it works because create does.
+        """
         return self._request(
             "DELETE", f"/trade-api/v2/portfolio/orders/{order_id}"
         )

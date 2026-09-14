@@ -7,6 +7,8 @@ Demo executor. Manual, one order at a time.
   python executor.py order --ticker T --side yes --count 1 --price 40 \
                           --window 20260913T2245 --quoted-at <iso>
   python executor.py cancel --order-id ...
+  python executor.py balance                  per-shard balance breakdown
+  python executor.py transfer --to 2 --amount 15
   python executor.py sync                     see what settled (writes nothing)
   python executor.py sync --apply             fold it into realised P&L
   python executor.py pnl --amount -1.25       record a result by hand
@@ -149,6 +151,63 @@ def cmd_rails(args) -> int:
     return 0
 
 
+def cmd_balance(args) -> int:
+    """
+    Per-shard balance breakdown.
+
+    Collateral is per shard. A total that looks healthy tells you nothing
+    about whether the shard your market lives on has anything on it.
+    """
+    banner()
+    try:
+        client = connect()
+        bal = client.balance()
+    except KalshiError as exc:
+        print(f"  {exc}\n")
+        return 1
+
+    total = bal.get("balance_dollars") or bal.get("balance")
+    print(f"  total: {total}")
+    print()
+    print(f"  {'shard':>8} {'balance':>12}")
+    print("  " + "-" * 22)
+    for row in (bal.get("balance_breakdown") or []):
+        print(f"  {row.get('exchange_index'):>8} {row.get('balance'):>12}")
+    print()
+    print("  An order routed to a shard with 0.00 is rejected as")
+    print("  insufficient_shard_balance, regardless of the total.")
+    print()
+    return 0
+
+
+def cmd_transfer(args) -> int:
+    banner()
+    print(f"  moving ${args.amount:.2f} from shard {args.source} "
+          f"to shard {args.to}")
+    print()
+
+    if not args.yes:
+        print("  Dry run. Re-run with --yes to actually move it.")
+        print()
+        return 0
+
+    try:
+        client = connect()
+        result = client.transfer(
+            dollars=args.amount, src_shard=args.source, dst_shard=args.to
+        )
+    except KalshiError as exc:
+        print(f"  transfer failed.\n  {exc}\n")
+        return 1
+
+    print(f"  transfer_id {result.get('transfer_id')}")
+    print()
+    print("  Transfers are processed asynchronously and cross-shard moves")
+    print("  are not atomic. Check `executor.py balance` before ordering.")
+    print()
+    return 0
+
+
 def cmd_sync(args) -> int:
     """
     Derive realised P&L from the exchange rather than from memory.
@@ -253,8 +312,11 @@ def cmd_order(args) -> int:
     )
 
     notional = (args.price * args.count) / 100.0
+    from core.kalshi_exec import to_v2
+    book_side, yes_price = to_v2(args.side, args.action, args.price)
     print(f"  {args.action} {args.count} x {args.side} @ {args.price}c "
           f"on {args.ticker}")
+    print(f"  sends as: {book_side} {yes_price / 100:.4f} on the YES leg")
     print(f"  notional ${notional:.2f}, window {args.window}")
     print()
 
@@ -275,6 +337,12 @@ def cmd_order(args) -> int:
 
     try:
         client = connect()
+
+        idx = args.exchange_index
+        if idx is None:
+            idx = client.exchange_index_for(args.ticker)
+            print(f"  market is on shard {idx}")
+
         result = client.place_limit(
             ticker=args.ticker,
             side=args.side,
@@ -282,6 +350,8 @@ def cmd_order(args) -> int:
             count=args.count,
             price_cents=args.price,
             client_order_id=str(uuid.uuid4()),
+            time_in_force=args.tif,
+            exchange_index=idx,
         )
     except KalshiError as exc:
         print(f"\n  order failed.\n  {exc}\n")
@@ -289,13 +359,26 @@ def cmd_order(args) -> int:
 
     state.record_order(args.window)
 
-    order = result.get("order", result)
+    # V2 response: order_id, fill_count, remaining_count, average_fill_price,
+    # average_fee_paid, ts_ms. There is no status field.
     print()
-    print(f"  sent. order_id {order.get('order_id')}")
-    print(f"  status {order.get('status')}")
+    print(f"  sent. order_id {result.get('order_id')}")
+    filled = result.get("fill_count")
+    remaining = result.get("remaining_count")
+    print(f"  filled {filled}, resting {remaining}")
+    if result.get("average_fill_price") is not None:
+        print(f"  avg fill price {result.get('average_fill_price')}")
+    if result.get("average_fee_paid") is not None:
+        print(f"  avg fee paid   {result.get('average_fee_paid')}")
     print()
     print(json.dumps(result, indent=2)[:800])
     print()
+
+    if filled in ("0.00", "0", 0):
+        print("  Nothing filled - the order is resting. On a zero-volume book")
+        print("  it may never fill. Use --tif immediate_or_cancel to find out")
+        print("  straight away instead of waiting.")
+        print()
     return 0
 
 
@@ -333,12 +416,28 @@ def main() -> int:
                    help="ISO time the book was read, or 'now'")
     o.add_argument("--suppressed", action="store_true",
                    help="declare this window suppressed (will be refused)")
+    o.add_argument("--tif", default="good_till_canceled",
+                   choices=["good_till_canceled", "immediate_or_cancel",
+                            "fill_or_kill"],
+                   help="time in force")
+    o.add_argument("--exchange-index", type=int, default=None,
+                   help="shard override; read off the market when omitted")
     o.add_argument("--yes", action="store_true", help="actually send it")
     o.set_defaults(fn=cmd_order)
 
     c = sub.add_parser("cancel", help="cancel a resting order")
     c.add_argument("--order-id", required=True)
     c.set_defaults(fn=cmd_cancel)
+
+    sub.add_parser("balance", help="per-shard balance").set_defaults(
+        fn=cmd_balance)
+
+    t = sub.add_parser("transfer", help="move collateral between shards")
+    t.add_argument("--to", type=int, required=True, help="destination shard")
+    t.add_argument("--source", type=int, default=0, help="source shard")
+    t.add_argument("--amount", type=float, required=True, help="dollars")
+    t.add_argument("--yes", action="store_true", help="actually move it")
+    t.set_defaults(fn=cmd_transfer)
 
     sy = sub.add_parser("sync", help="derive P&L from settlements")
     sy.add_argument("--apply", action="store_true", help="actually write it")

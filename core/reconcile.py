@@ -10,37 +10,43 @@ protecting you, while still printing a reassuring number.
 
 This derives the same figure from what the exchange says actually happened.
 
-THE FIELD NAMES ARE NOT CONFIRMED
----------------------------------
-Kalshi's settlement and fill objects are read here by trying several plausible
-key names for each quantity. That is not defensive programming for its own
-sake - it is an admission that this code was written against documentation
-rather than against real responses, and the exact schema has not been seen.
+THE UNITS ARE MIXED, IN THE SAME OBJECT
+---------------------------------------
+This mapping is now confirmed against a real settlement. The thing to know is
+that one settlement record carries money in two different units:
 
-The consequence is deliberate: a record whose fields cannot be read is
-reported as UNPARSEABLE and contributes nothing. It is never treated as zero.
-A P&L tracker that silently scores unknown records as break-even is worse than
-one that refuses, because the loss cap would then be computed from a number
-that looks complete and is not.
+    revenue: 100                      integer CENTS
+    yes_total_cost_dollars: "0.85"    STRING DOLLARS
+    fee_cost: "0.009000"              STRING DOLLARS
 
-Run `executor.py sync --dry-run` first. It prints the raw records next to what
-it believes they mean. Read them. If the mapping is wrong, fix `FIELD_NAMES`
-below - it is one dict - and only then run with --apply.
+Reading a dollar string as cents understates a cost by 100x; reading cents as
+dollars overstates revenue by the same. Both directions flatter or distort the
+P&L that gates trading, so the two units get two separate converters and each
+field is mapped to exactly one of them. Never add a field to the wrong list.
+
+FEES COME FROM THE SETTLEMENT, NOT THE FILLS
+--------------------------------------------
+The settlement record carries `fee_cost` covering the fills that built the
+position. Fills carry their own `fee_cost` too, so summing both would
+double-count every fee. The settlement is the authority; fills are only a
+fallback for a settlement that somehow lacks the field.
+
+WHEN A RECORD CANNOT BE READ
+----------------------------
+It is reported as UNPARSEABLE and contributes nothing. It is never treated as
+zero. A P&L tracker that silently scores unknown records as break-even is
+worse than one that refuses, because the loss cap would then be computed from
+a number that looks complete and is not. This is not hypothetical: the first
+version of this module guessed `yes_total_cost` and the real field is
+`yes_total_cost_dollars`. Refusing is what surfaced that.
+
+If Kalshi changes the schema again, `executor.py sync --raw` prints the raw
+records beside what this code believes they mean. Fix `CENTS_FIELDS` and
+`DOLLAR_FIELDS` below, then re-run.
 
 THE ARITHMETIC
 --------------
-For a settled market:
-
     pnl = revenue - cost - fees
-
-`revenue` is what the exchange paid out, `cost` is what the contracts cost to
-acquire, `fees` come from the fills that built the position. Settlement
-revenue is gross, so fees must be pulled separately from the fill records or
-losses will be understated - which is the direction that matters, since it is
-the direction that keeps the loss cap from firing.
-
-All exchange money values are integer cents. They are converted to dollars
-once, at the boundary, and everything downstream is dollars.
 
 Standard library only.
 """
@@ -50,18 +56,28 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-# Candidate key names, most likely first. Edit here if the real API disagrees.
+# Confirmed against a real KXBTC15M settlement, 2026-09-14.
 FIELD_NAMES = {
     "ticker": ("ticker", "market_ticker"),
-    "revenue": ("revenue", "settlement_revenue", "payout"),
-    "yes_cost": ("yes_total_cost", "yes_cost", "total_yes_cost"),
-    "no_cost": ("no_total_cost", "no_cost", "total_no_cost"),
-    "settled_at": ("settled_time", "settled_at", "determined_time", "ts"),
-    "fee": ("fee", "fee_cents", "taker_fee", "fees"),
+    "revenue": ("revenue", "value"),
+    "yes_cost": ("yes_total_cost_dollars",),
+    "no_cost": ("no_total_cost_dollars",),
+    "settled_at": ("settled_time", "settled_at", "determined_time"),
+    "fee": ("fee_cost",),
     "fill_ticker": ("ticker", "market_ticker"),
     "fill_time": ("created_time", "created_at", "ts"),
     "fill_id": ("trade_id", "fill_id", "id"),
 }
+
+# Only field names confirmed against a real response are listed. Plausible
+# legacy names like `yes_total_cost` and `fee_cents` are deliberately absent:
+# their unit is unknown, and a name in the wrong converter list is a silent
+# 100x error. An unrecognised schema should fail loudly as UNPARSEABLE, not
+# be guessed at.
+
+# Which converter each field needs. A field in neither list is a bug.
+CENTS_FIELDS = {"revenue"}
+DOLLAR_FIELDS = {"yes_cost", "no_cost", "fee"}
 
 
 def pick(record: dict, names: tuple[str, ...]):
@@ -73,10 +89,43 @@ def pick(record: dict, names: tuple[str, ...]):
 
 
 def cents_to_dollars(v) -> float | None:
-    """Exchange money is integer cents. Reject anything that is not a number."""
+    """
+    Integer cents -> dollars. Used ONLY for fields in CENTS_FIELDS.
+
+    Rejects strings deliberately. A dollar string like "0.85" read as cents
+    would silently become $0.0085, and nothing downstream would notice.
+    """
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
     return v / 100.0
+
+
+def dollars_to_dollars(v) -> float | None:
+    """
+    Dollar string (or number) -> dollars. For fields in DOLLAR_FIELDS.
+
+    Kalshi sends these as fixed-point strings: "0.850000", "0.009000".
+    """
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v)
+        except ValueError:
+            return None
+    return None
+
+
+def money(record: dict, field: str) -> float | None:
+    """Read one money field using the converter its unit requires."""
+    raw = pick(record, FIELD_NAMES[field])
+    if field in CENTS_FIELDS:
+        return cents_to_dollars(raw)
+    if field in DOLLAR_FIELDS:
+        return dollars_to_dollars(raw)
+    raise KeyError(f"{field} is in neither CENTS_FIELDS nor DOLLAR_FIELDS")
 
 
 def parse_time(v) -> datetime | None:
@@ -136,21 +185,18 @@ class Settled:
 
 def fees_by_ticker(fills: list[dict]) -> dict[str, float]:
     """
-    Total fees per ticker, in dollars.
+    Total fees per ticker, in dollars. FALLBACK ONLY.
 
-    A fill whose fee cannot be read contributes nothing rather than zero, and
-    the caller is told via `unreadable`. Silently dropping fees understates
-    losses.
+    The settlement record carries its own `fee_cost` covering the fills that
+    built the position, and that is what parse_settlement uses. This is here
+    for a settlement that lacks the field. Using both would double-count.
     """
     totals: dict[str, float] = {}
     unreadable = 0
     for f in fills or []:
         ticker = pick(f, FIELD_NAMES["fill_ticker"])
-        fee = cents_to_dollars(pick(f, FIELD_NAMES["fee"]))
-        if ticker is None:
-            unreadable += 1
-            continue
-        if fee is None:
+        fee = dollars_to_dollars(pick(f, FIELD_NAMES["fee"]))
+        if ticker is None or fee is None:
             unreadable += 1
             continue
         totals[ticker] = round(totals.get(ticker, 0.0) + fee, 4)
@@ -177,15 +223,18 @@ def parse_settlement(s: dict, fees: dict[str, float]) -> Settled:
     if ticker is None:
         problems.append("no ticker field")
 
-    revenue = cents_to_dollars(pick(s, FIELD_NAMES["revenue"]))
+    revenue = money(s, "revenue")
     if revenue is None:
         problems.append(f"no readable revenue (tried {FIELD_NAMES['revenue']})")
 
-    yes_cost = cents_to_dollars(pick(s, FIELD_NAMES["yes_cost"]))
-    no_cost = cents_to_dollars(pick(s, FIELD_NAMES["no_cost"]))
+    yes_cost = money(s, "yes_cost")
+    no_cost = money(s, "no_cost")
     if yes_cost is None and no_cost is None:
         problems.append(f"no readable cost (tried {FIELD_NAMES['yes_cost']})")
     cost = (yes_cost or 0.0) + (no_cost or 0.0)
+
+    # The settlement's own fee is authoritative; fills are a fallback.
+    fee = money(s, "fee")
 
     at = parse_time(pick(s, FIELD_NAMES["settled_at"]))
     day = utc_day_of(at)
@@ -201,7 +250,7 @@ def parse_settlement(s: dict, fees: dict[str, float]) -> Settled:
         ticker=ticker,
         revenue=revenue,
         cost=cost if revenue is not None else None,
-        fees=fees.get(ticker, 0.0) if ticker else 0.0,
+        fees=fee if fee is not None else (fees.get(ticker, 0.0) if ticker else 0.0),
         day=day,
         raw=s,
         problems=problems,
