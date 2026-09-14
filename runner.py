@@ -131,6 +131,49 @@ def choose(record: dict, min_edge: float) -> dict | None:
     return best
 
 
+def wait_for_close(close: datetime) -> bool:
+    """
+    Sleep until the window has closed.
+
+    Without this the caller loops straight back into the same window and
+    decides it again, and again - the first version of this file fired a few
+    hundred times on one window because deciding at T-4 returned immediately
+    and nothing waited out the remaining four minutes.
+    """
+    remaining = (close - datetime.now(timezone.utc)).total_seconds() + 20
+    return _sleep(remaining) if remaining > 0 else False
+
+
+def check_spot_freshness(rec: Recorder) -> None:
+    """
+    Print how old the candle the model is pricing from actually is.
+
+    Spot appeared frozen at one price across several minutes, which cannot
+    happen with a live feed. Either the feed is caching, or the candle list
+    is ordered newest-first and `candles[-1]` is the OLDEST bar rather than
+    the newest - in which case the model has been pricing off a spot two
+    hours stale, everywhere, including in the logged data. Printing the
+    timestamp settles which.
+    """
+    try:
+        candles = rec.feed.candles(granularity=60, limit=5)
+    except Exception as exc:
+        print(f"   (could not check feed: {exc})")
+        return
+    if not candles:
+        return
+    first, last = candles[0], candles[-1]
+    now = datetime.now(timezone.utc)
+    age = (now - last.ts).total_seconds() / 60
+    print(f"   candle[-1] {last.ts.strftime('%H:%M')} (${last.close:,.2f}, "
+          f"{age:+.0f} min old)   candle[0] {first.ts.strftime('%H:%M')} "
+          f"(${first.close:,.2f})")
+    if age > 5:
+        print("   WARNING: the bar being priced from is stale. If candle[0] is")
+        print("   newer than candle[-1], the list is reversed and every spot")
+        print("   in this project is wrong.")
+
+
 def run_window(rec: Recorder, client, rails, state, args) -> None:
     now = datetime.now(timezone.utc)
     close = window_close(now)
@@ -140,15 +183,19 @@ def run_window(rec: Recorder, client, rails, state, args) -> None:
     fire_at = close - timedelta(minutes=args.horizon)
     wait = (fire_at - datetime.now(timezone.utc)).total_seconds()
     if wait < -30:
-        print("   started mid-window, skipping")
-        _sleep((close - datetime.now(timezone.utc)).total_seconds() + 5)
+        print(f"   started mid-window, waiting for the next one "
+              f"({(close - now).total_seconds() / 60:.0f} min)")
+        wait_for_close(close)
         return
     if wait > 0 and _sleep(wait):
         return
 
+    check_spot_freshness(rec)
+
     record = rec.snapshot(close, args.horizon)
     if not record:
         print("   no reading")
+        wait_for_close(close)
         return
 
     print(f"   spot ${record['spot']:,.2f}   sigma {record['sigma'] * 100:.3f}%"
@@ -157,11 +204,13 @@ def run_window(rec: Recorder, client, rails, state, args) -> None:
 
     if record["ladder"] != "kalshi":
         print("   no real book - not trading a synthetic ladder")
+        wait_for_close(close)
         return
 
     pick = choose(record, args.edge)
     if not pick:
         print(f"   nothing over {args.edge:.0%} edge; standing down")
+        wait_for_close(close)
         return
 
     print(f"   {pick['ticker']}  strike {pick['strike']:,.0f}")
@@ -179,11 +228,13 @@ def run_window(rec: Recorder, client, rails, state, args) -> None:
         for r in decision.reasons:
             print(f"     - {r}")
         log(dict(window_id=wid, action="refused", reasons=decision.reasons, **pick))
+        wait_for_close(close)
         return
 
     if args.dry_run:
         print("   dry run, not sent")
         log(dict(window_id=wid, action="dry_run", **pick))
+        wait_for_close(close)
         return
 
     try:
@@ -198,6 +249,7 @@ def run_window(rec: Recorder, client, rails, state, args) -> None:
     except KalshiError as exc:
         print(f"   order failed: {exc}")
         log(dict(window_id=wid, action="error", error=str(exc), **pick))
+        wait_for_close(close)
         return
 
     state.record_order(wid)
@@ -205,6 +257,7 @@ def run_window(rec: Recorder, client, rails, state, args) -> None:
     print(f"   filled {filled} @ {result.get('average_fill_price')}"
           f"  fee {result.get('average_fee_paid')}")
     log(dict(window_id=wid, action="sent", result=result, **pick))
+    wait_for_close(close)
 
 
 def log(entry: dict) -> None:
@@ -259,12 +312,21 @@ def main() -> int:
     print(f"  writing to {RUNNER_LOG.name} (predictions.jsonl untouched)")
     print("  Ctrl-C to stop after the current window.")
 
+    seen: set[str] = set()
     while not _stop:
         try:
+            wid = window_id(window_close(datetime.now(timezone.utc)))
+            if wid in seen:
+                # wait_for_close should make this impossible; if it happens,
+                # sleep rather than spin.
+                time.sleep(10)
+                continue
+            seen.add(wid)
             run_window(rec, client, rails, state, args)
         except Exception as exc:                     # keep the soak running
             print(f"   unexpected: {exc}", file=sys.stderr)
             log({"action": "crash", "error": str(exc)})
+            time.sleep(10)
         if args.once:
             break
 

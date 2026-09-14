@@ -278,7 +278,7 @@ class LoggerLadder(unittest.TestCase):
         rec = self.make(CannedMarket(quotes_around(100_000, self.close)))
         out = rec.snapshot(self.close, 12, now=self.now)
         self.assertIsNotNone(out)
-        self.assertEqual(out["schema"], 2)
+        self.assertEqual(out["schema"], 3)
         self.assertEqual(out["ladder"], "kalshi")
         self.assertEqual(len(out["predictions"]), 5)
         for item in out["predictions"]:

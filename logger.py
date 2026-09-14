@@ -25,7 +25,25 @@ beat the price it would have paid? When Kalshi is unreachable the logger
 falls back to a synthetic ladder around spot, marks the record accordingly,
 and keeps going - calibration can still be measured, edge cannot.
 
-Records carry "schema": 2. Older lines without it are still readable.
+SPOT COMES FROM THE TICKER, NOT THE CANDLES
+-------------------------------------------
+Coinbase's /candles route serves cached completed bars and runs several
+minutes behind the market. Measured directly: the newest bar was 5.3 minutes
+old and $88 away from the live price, against a typical 15-minute sigma of
+about $60. Pricing a window from that bar means answering a question about a
+price that no longer exists - and worse, the exchange has seen the move that
+the model has not, so every disagreement with the book is contaminated by
+information the model simply did not have.
+
+Every record written before schema 3 was priced this way. Treat pre-schema-3
+windows as measuring a model reading a five-minute-old price, which is not
+the model anyone would choose to run.
+
+Candles are still used for volatility. Lag does not matter there: the
+question is how much price has been moving, not where it is right now.
+
+Records carry "schema": 3. Older lines are still readable; the schema number
+is what distinguishes stale-spot records from live-spot ones.
 """
 
 from __future__ import annotations
@@ -45,7 +63,7 @@ from core.kalshi import estimate_vol, prob_above
 from core.kalshi_api import DEFAULT_SERIES, KalshiError, KalshiMarketData
 
 LOG = Path(__file__).parent / "predictions.jsonl"
-SCHEMA = 2
+SCHEMA = 3
 _stop = False
 
 
@@ -82,6 +100,7 @@ class Recorder:
         self._hourly = None
         self._hourly_at = 0.0
         self._market_warned = False
+        self._spot_warned = False
         self.last_ladder = None  # "kalshi" or "synthetic", for the console line
 
     def _book(self, close: datetime, now: datetime):
@@ -113,6 +132,31 @@ class Recorder:
                 self._market_warned = True
             return None
         return quotes
+
+    def spot(self, candles) -> tuple[float, str]:
+        """
+        The live price, and where it came from.
+
+        /ticker is real time. /candles is cached and several minutes behind,
+        so it is only a fallback - a stale spot is better than no reading at
+        all, but the record says which was used so the scorer can separate
+        them rather than silently mixing two different models.
+
+        AttributeError is caught alongside FeedError because an injected feed
+        (a test double, or some future source) may legitimately have no
+        ticker endpoint. That is a fallback, not a crash. It is never silent:
+        the record carries spot_source="candle" and the console prints
+        STALE SPOT, so a real feed that lost its spot_price would be visible
+        within one window rather than quietly degrading every prediction.
+        """
+        try:
+            return self.feed.spot_price(), "ticker"
+        except (FeedError, AttributeError) as exc:
+            if not self._spot_warned:
+                print(f"  ticker unavailable, falling back to the (stale) "
+                      f"candle close: {exc}", file=sys.stderr)
+                self._spot_warned = True
+            return candles[-1].close, "candle"
 
     def hourly(self):
         if self._hourly and time.time() - self._hourly_at < 1800:
@@ -150,7 +194,14 @@ class Recorder:
         # If the loop was late the real gap no longer matches the horizon we
         # meant to sample. Record both so the scorer can group honestly.
         actual_horizon = round(minutes_left, 2)
-        spot = candles[-1].close
+
+        # Spot from the live ticker; candles only for volatility. See the
+        # module docstring - the candle feed runs minutes behind and pricing
+        # from it hands the exchange a free information advantage.
+        spot, spot_source = self.spot(candles)
+        candle_spot = candles[-1].close
+        candle_age_min = round((now - candles[-1].ts).total_seconds() / 60, 2)
+
         vol = estimate_vol(candles, 1.0)
 
         ctx = Context(
@@ -222,6 +273,11 @@ class Recorder:
             "at": now.isoformat(),
             "window_close": close.isoformat(),
             "spot": round(spot, 2),
+            "spot_source": spot_source,
+            # Kept so the size of the old bug stays measurable in the log
+            # itself rather than only in this docstring.
+            "candle_spot": round(candle_spot, 2),
+            "candle_age_min": candle_age_min,
             "sigma": round(sigma, 8),
             "base_sigma": round(est.base_sigma, 8),
             "vol_change_pct": round(est.total_vol_change_pct, 2),
@@ -250,6 +306,11 @@ class Recorder:
 
         # The candle whose timestamp is the close minute, or the closest
         # available. Using "latest price now" would drift if the loop is late.
+        #
+        # Note this path deliberately still uses candles: resolving asks where
+        # price WAS at a past instant, which is exactly what a completed bar
+        # records. The lag that ruins a live spot is harmless here, and the
+        # `trustworthy` flag already catches a bar too far from the close.
         target = close - timedelta(minutes=1)
         best = min(candles, key=lambda c: abs((c.ts - target).total_seconds()))
         drift = abs((best.ts - target).total_seconds())
@@ -285,9 +346,10 @@ class Recorder:
                 flag = "  SUPPRESSED" if rec["suppressed"] else ""
                 book = (f"  book {len(rec['predictions'])} strikes"
                         if rec["ladder"] == "kalshi" else "  no book")
+                stale = "" if rec["spot_source"] == "ticker" else "  STALE SPOT"
                 print(
                     f"    T-{h:<2}  spot ${rec['spot']:>10,.2f}   "
-                    f"sigma {rec['sigma'] * 100:.3f}%{book}{flag}"
+                    f"sigma {rec['sigma'] * 100:.3f}%{book}{flag}{stale}"
                 )
 
         wait = (close - datetime.now(timezone.utc)).total_seconds() + 20
@@ -332,6 +394,7 @@ def main() -> int:
 
     print(f"  Logging to {args.out}")
     print(f"  Readings at T-{', T-'.join(str(h) for h in rec.horizons)} minutes")
+    print("  Spot from the live ticker; candles for volatility only")
     if market:
         print(f"  Kalshi book from series {market.series} (read-only, no login)")
     else:
