@@ -206,8 +206,8 @@ def quote_from_market(market: dict, quoted_at: datetime | None = None) -> Quote 
         no_bid=_price(market, "no_bid"),
         no_ask=_price(market, "no_ask"),
         last_price=_price(market, "last_price"),
-        volume=int(market.get("volume") or 0),
-        open_interest=int(market.get("open_interest") or 0),
+               volume=_count(market, "volume"),
+        open_interest=_count(market, "open_interest"),
         close_time=_parse_time(market.get("close_time")),
         quoted_at=quoted_at or datetime.now(timezone.utc),
     )
