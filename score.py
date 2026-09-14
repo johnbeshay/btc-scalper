@@ -2,33 +2,70 @@
 Score the log. Does the model's 70% actually mean 70%? And does it beat the
 price Kalshi was charging?
 
-    python score.py
+    python score.py                 # schema 3 only: live-spot records
+    python score.py --schema all    # everything, with a warning
+    python score.py --schema 2      # the old stale-spot era, for comparison
     python score.py --by-horizon
-    python score.py --no-drift        # re-price every row with drift zeroed
+    python score.py --no-drift      # re-price every row with drift zeroed
 
 Reads predictions.jsonl, joins predictions to outcomes, and reports:
 
-  Brier score      mean squared error of the probabilities. Lower is better.
-                   0.25 is what you get by always saying 50%. Above that means
-                   the model is worse than useless.
+  Brier score     mean squared error of the probabilities. Lower is better.
+                  0.25 is what you get by always saying 50%. Above that means
+                  the model is worse than useless.
 
-  Skill vs 50%     Brier compared against always-50%. Positive means the model
-                   knows something. This number is EASY to inflate: a strike
-                   two sigmas away with four minutes left is nearly decided,
-                   and getting it right is not information you can sell.
+  Skill vs 50%    Brier compared against always-50%. Positive means the model
+                  knows something. This number is EASY to inflate: a strike
+                  two sigmas away with four minutes left is nearly decided,
+                  and getting it right is not information you can sell.
 
-  Skill vs market  Brier compared against the Kalshi mid price. This is the
-                   number that decides whether an executor should exist. Only
-                   available for rows where the logger captured the book.
+  Skill vs market Brier compared against the Kalshi mid price. This is the
+                  number that decides whether an executor should exist. Now
+                  reported with a confidence interval, because a point
+                  estimate here was being read as far more settled than the
+                  data supports.
 
-  Calibration      predictions bucketed by confidence, compared against how
-                   often those cases actually happened. n counts calls;
-                   rdg counts independent readings. Nine strikes from one
-                   reading are one look at the market, not nine, and the
-                   error bars use rdg for that reason.
+  Calibration     predictions bucketed by confidence, compared against how
+                  often those cases actually happened. n counts calls;
+                  rdg counts independent readings.
 
-  Near the money   the 0-0.5 sigma band, shown by default because it is the
-                   only band anyone can trade at a sane fee.
+TWO ERAS OF DATA
+----------------
+Records before schema 3 were priced from Coinbase's /candles feed, which runs
+minutes behind the market - measured at 5.3 minutes stale and $88 away from
+the live price, against a typical 15-minute sigma of about $60. Those windows
+measure a model that could not see moves the exchange had already seen, so
+every disagreement with the book is contaminated by information the model
+simply did not have.
+
+They are not garbage, but they are a different model. Pooling them with
+schema 3 averages two things and tells you about neither, so the default is
+schema 3 only and everything else is opt-in.
+
+WHY THE ERROR BARS CLUSTER ON THE WINDOW
+----------------------------------------
+Nine strikes from one reading are one look at the market, not nine - they
+rise and fall together with the same price move. The calibration table has
+always used readings rather than calls for this reason.
+
+The same argument applies one level up, and was being missed. Three readings
+of the same 15-minute window, taken four minutes apart, are not independent
+either: they share a window, a sigma, a set of agent multipliers and mostly
+the same price path. The independent unit is the WINDOW.
+
+So skill vs market is bootstrapped by resampling windows, not rows. How much
+that widens the interval depends on how correlated the errors actually are.
+Measured on simulated logs: when the model's error is independent per strike
+the difference is small, around 1.1x. When the error is a shared per-window
+sigma mis-estimate - which is how a volatility model actually fails, one bad
+sigma skewing every strike the same way - the window-clustered interval came
+out about 2.1x wider than a row-level one.
+
+Two times is not the order of magnitude a naive count of calls would suggest,
+and it is not nothing either. It is the difference between an interval that
+excludes zero and one that does not, in exactly the range these numbers sit
+in. A headline like "-13%" quoted without an interval was never as settled as
+it read.
 """
 
 from __future__ import annotations
@@ -36,12 +73,19 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 from collections import defaultdict
 from pathlib import Path
 
 from core.kalshi import prob_above
 
 LOG = Path(__file__).parent / "predictions.jsonl"
+LIVE_SPOT_SCHEMA = 3
+
+# Independent windows, not calls. Below MIN_WINDOWS nothing is printed at
+# all; between the two, numbers print with a caution banner.
+MIN_WINDOWS = 20
+COMFORTABLE_WINDOWS = 200
 
 
 def load(path: Path, zero_drift: bool = False):
@@ -51,10 +95,12 @@ def load(path: Path, zero_drift: bool = False):
     Every row keeps the keys older callers expect (window_id, horizon,
     suppressed, p, sigmas, hit, spot, strike, close) and adds:
 
-        reading   (window_id, horizon) - the independent unit
-        ladder    "kalshi" or "synthetic"
-        p_yes     model probability the YES contract pays
-        mkt_p     market's implied P(above) from the mid, or None
+        reading     (window_id, horizon) - one look at the market
+        schema      record version; 3+ means spot came from the live ticker
+        spot_source "ticker" or "candle" on schema 3+, None before
+        ladder      "kalshi" or "synthetic"
+        p_yes       model probability the YES contract pays
+        mkt_p       market's implied P(above) from the mid, or None
         yes_bid / yes_ask / no_ask   book in dollars, or None
         sigma, drift_pct             so p can be re-derived
 
@@ -63,7 +109,6 @@ def load(path: Path, zero_drift: bool = False):
     historically did not. Fully offline; the log already has every input.
     """
     preds, outs = [], {}
-
     if not path.exists():
         return [], 0, 0
 
@@ -90,6 +135,7 @@ def load(path: Path, zero_drift: bool = False):
         close = out["close_price"]
         spot = p["spot"]
         sigma = p.get("sigma")
+
         for item in p["predictions"]:
             strike = item["strike"]
             prob = item["p_above"]
@@ -101,6 +147,9 @@ def load(path: Path, zero_drift: bool = False):
                     "window_id": p["window_id"],
                     "horizon": p["horizon_min"],
                     "reading": (p["window_id"], p["horizon_min"]),
+                    "schema": p.get("schema", 1),
+                    "spot_source": p.get("spot_source"),
+                    "candle_age_min": p.get("candle_age_min"),
                     "ladder": p.get("ladder", "synthetic"),
                     "suppressed": p.get("suppressed", False),
                     "p": prob,
@@ -135,6 +184,51 @@ def skill_pct(model: float, base: float) -> float:
 
 def n_readings(rows) -> int:
     return len({r["reading"] for r in rows})
+
+
+def n_windows(rows) -> int:
+    return len({r["window_id"] for r in rows})
+
+
+def bootstrap_skill(rows, key: str = "mkt_p", iters: int = 2000,
+                    seed: int = 0) -> tuple[float, float, float] | None:
+    """
+    Confidence interval for Brier skill, resampling WINDOWS with replacement.
+
+    Returns (point_estimate, lo_2.5pct, hi_97.5pct), or None if there are too
+    few windows to say anything.
+
+    Resampling windows rather than rows is the whole point. Rows inside a
+    window share a price path; drawing rows independently would manufacture
+    a sample far larger than the evidence, and produce a tight interval
+    around a number that is not actually pinned down.
+    """
+    by_window = defaultdict(list)
+    for r in rows:
+        by_window[r["window_id"]].append(r)
+    windows = list(by_window)
+    if len(windows) < 20:
+        return None
+
+    point = skill_pct(brier(rows), brier(rows, key))
+
+    rng = random.Random(seed)
+    draws = []
+    for _ in range(iters):
+        sample = []
+        for _ in windows:
+            sample.extend(by_window[rng.choice(windows)])
+        try:
+            draws.append(skill_pct(brier(sample), brier(sample, key)))
+        except ZeroDivisionError:
+            continue
+
+    if not draws:
+        return None
+    draws.sort()
+    lo = draws[int(0.025 * len(draws))]
+    hi = draws[int(0.975 * len(draws)) - 1]
+    return point, lo, hi
 
 
 def calibration(rows, buckets=10):
@@ -200,33 +294,56 @@ def distance_band(r) -> str:
     return "beyond 2 sd"
 
 
+def schema_summary(rows) -> dict:
+    counts = defaultdict(set)
+    for r in rows:
+        counts[r["schema"]].add(r["window_id"])
+    return {k: len(v) for k, v in sorted(counts.items())}
+
+
 def report(rows, total_preds, unresolved):
     n = len(rows)
     rdg = n_readings(rows)
+    win = n_windows(rows)
+
     print()
     print("=" * 64)
-    print(f"  {n:,} resolved calls from {rdg:,} readings "
-          f"({rdg / 3:.0f} windows if 3 per window)")
+    print(f"  {n:,} resolved calls from {rdg:,} readings across {win:,} windows")
+    print(f"  the independent unit is the WINDOW: {win:,}")
     if unresolved:
         print(f"  {unresolved:,} readings excluded (no trustworthy close yet)")
     print("=" * 64)
 
-    if n < 50:
+    # The floor is deliberately low now. Refusing to print was the right
+    # call when the headline number came with no interval attached - a bare
+    # "-13%" off thirty windows invites exactly the wrong conclusion. With a
+    # bootstrap interval on it, a small sample speaks for itself: the
+    # interval comes out enormous and says so. Showing that beats silence,
+    # which teaches nothing about how much data would be enough.
+    if win < MIN_WINDOWS:
         print()
-        print("  Not enough data to say anything yet.")
-        print("  Keep the logger running. Around 500 calls is where the")
-        print(f"  calibration curve starts to mean something; you have {n}.")
+        print(f"  Only {win} independent windows. Nothing here is meaningful yet.")
+        print("  Calls and readings are not the sample size - strikes and")
+        print("  readings inside a window move together.")
+        print("  Keep the logger running.")
         print()
         return
+
+    if win < COMFORTABLE_WINDOWS:
+        print()
+        print(f"  CAUTION: {win} independent windows. Every number below is")
+        print(f"  provisional - {COMFORTABLE_WINDOWS}+ is where they start to")
+        print("  settle. Read the interval on skill vs market, not the point")
+        print("  estimate.")
 
     b = brier(rows)
     base = brier([{**r, "p": 0.5} for r in rows])
     skill = skill_pct(b, base)
 
     print()
-    print(f"  Brier score       {b:.4f}")
-    print(f"  Always-50% score  {base:.4f}")
-    print(f"  Skill vs 50%      {skill:+.1f}%   ", end="")
+    print(f"  Brier score          {b:.4f}")
+    print(f"  Always-50% score     {base:.4f}")
+    print(f"  Skill vs 50%         {skill:+.1f}%  ", end="")
     if skill > 10:
         print("beats guessing - but see the near-money line below")
     elif skill > 2:
@@ -242,35 +359,48 @@ def report(rows, total_preds, unresolved):
     if priced:
         mb = brier(priced)
         mk = brier(priced, key="mkt_p")
+        pw = n_windows(priced)
         print(f"  Rows with a Kalshi price   {len(priced):,} "
-              f"({n_readings(priced):,} readings)")
+              f"({n_readings(priced):,} readings, {pw:,} windows)")
         print(f"  Model Brier on those       {mb:.4f}")
         print(f"  Market-mid Brier           {mk:.4f}")
-        print(f"  Skill vs market            {skill_pct(mb, mk):+.1f}%   ", end="")
+
+        ci = bootstrap_skill(priced)
         s = skill_pct(mb, mk)
-        if s > 5:
-            print("model beats the book - check it holds near the money")
-        elif s > 0:
-            print("marginal - fees will eat most of this")
-        elif s > -5:
-            print("about even with the book")
+        if ci:
+            _, lo, hi = ci
+            print(f"  Skill vs market            {s:+.1f}%  "
+                  f"[95% CI {lo:+.1f}% to {hi:+.1f}%]")
+            print()
+            if lo > 0:
+                print("  The whole interval is above zero: the model beats the")
+                print("  book on this data. Check it holds near the money.")
+            elif hi < 0:
+                print("  The whole interval is below zero: the market prices")
+                print("  this better than the model does.")
+            else:
+                print("  The interval spans zero. On this much data the model")
+                print("  is NOT distinguishable from the book, in either")
+                print("  direction. A point estimate here means little; more")
+                print("  windows is the only thing that narrows it.")
         else:
-            print("the market prices this better than the model does")
+            print(f"  Skill vs market            {s:+.1f}%  "
+                  f"(too few windows for an interval)")
     else:
-        print("  Skill vs market            (no Kalshi prices in the log)")
+        print("  Skill vs market      (no Kalshi prices in the log)")
         print("  Run the logger with Kalshi reachable to measure edge.")
-        print("  Check with:  python kalshi_book.py")
+        print("  Check with: python kalshi_book.py")
 
     # ---- calibration ----------------------------------------------------
     print()
     print("  Calibration")
     print("  " + "-" * 62)
-    print(f"  {'says':>8}  {'actually':>8}  {'n':>6}  {'rdg':>5}  {'off by':>7}   chart")
+    print(f"  {'says':>8} {'actually':>8} {'n':>6} {'rdg':>5} {'off by':>7}  chart")
     for c in calibration(rows):
         flag = " *" if c["significant"] else "  "
         print(
-            f"  {c['predicted'] * 100:>7.1f}%  {c['actual'] * 100:>7.1f}%  "
-            f"{c['n']:>6,}  {c['readings']:>5,}  {c['error'] * 100:>+6.1f}%{flag} "
+            f"  {c['predicted'] * 100:>7.1f}% {c['actual'] * 100:>7.1f}% "
+            f"{c['n']:>6,} {c['readings']:>5,} {c['error'] * 100:>+6.1f}%{flag} "
             f"{bar(c['predicted'], c['actual'])}"
         )
     print("  " + "-" * 62)
@@ -280,6 +410,7 @@ def report(rows, total_preds, unresolved):
     # ---- near the money, always -----------------------------------------
     print()
     by_group(rows, distance_band, "By distance from the money")
+
     near = [r for r in rows if abs(r["sigmas"]) < 0.5]
     if len(near) >= 20:
         print("  The 0.0 - 0.5 sd band is the one you can trade. Skill there is")
@@ -318,10 +449,12 @@ def by_group(rows, key, label, fmt=str):
 
     print(f"  {label}")
     print("  " + "-" * 62)
-    head = f"  {'group':>14}  {'n':>6}  {'rdg':>5}  {'brier':>6}  {'vs 50%':>7}  {'conf bias':>9}"
+    head = (f"  {'group':>14} {'n':>6} {'win':>5} {'brier':>6} "
+            f"{'vs 50%':>7} {'conf bias':>9}")
     if any_market:
-        head += f"  {'vs mkt':>7}"
+        head += f" {'vs mkt':>7}"
     print(head)
+
     for g in sorted(grouped):
         rs = grouped[g]
         if len(rs) < 20:
@@ -329,17 +462,20 @@ def by_group(rows, key, label, fmt=str):
         b = brier(rs)
         base = brier([{**r, "p": 0.5} for r in rs])
         line = (
-            f"  {fmt(g):>14}  {len(rs):>6,}  {n_readings(rs):>5,}  {b:>6.4f}  "
-            f"{skill_pct(b, base):>+6.1f}%  {confidence_bias(rs):>+8.1f}%"
+            f"  {fmt(g):>14} {len(rs):>6,} {n_windows(rs):>5,} {b:>6.4f} "
+            f"{skill_pct(b, base):>+6.1f}% {confidence_bias(rs):>+8.1f}%"
         )
         if any_market:
             priced = [r for r in rs if r["mkt_p"] is not None]
             if len(priced) >= 20:
-                line += f"  {skill_pct(brier(priced), brier(priced, 'mkt_p')):>+6.1f}%"
+                line += f" {skill_pct(brier(priced), brier(priced, 'mkt_p')):>+6.1f}%"
             else:
-                line += f"  {'-':>7}"
+                line += f" {'-':>7}"
         print(line)
+
     print("  " + "-" * 62)
+    print("  win: independent windows behind the row. A group with few windows")
+    print("  says little however large n looks.")
     print("  conf bias: how much more (or less) often the model's favoured side")
     print("  won than it claimed. Negative means overconfident.")
     if any_market:
@@ -358,16 +494,62 @@ def main() -> int:
                    help="re-price every row with the drift term removed")
     p.add_argument("--include-suppressed", action="store_true",
                    help="include windows the agents flagged as untradeable")
+    p.add_argument("--schema", default=str(LIVE_SPOT_SCHEMA),
+                   help=(f"record version to score: a number, or 'all'. "
+                         f"Default {LIVE_SPOT_SCHEMA} - records before that "
+                         f"were priced from a stale candle feed and measure a "
+                         f"different model."))
     args = p.parse_args()
 
     rows, total, unresolved = load(Path(args.log), zero_drift=args.no_drift)
-
     if not rows:
         print()
         print(f"  Nothing scored yet. Is {args.log} there and has a window closed?")
-        print("  Start with:  python logger.py")
+        print("  Start with: python logger.py")
         print()
         return 0
+
+    # ---- schema selection ------------------------------------------------
+    present = schema_summary(rows)
+    if args.schema.lower() == "all":
+        if len(present) > 1:
+            print()
+            print("  WARNING: pooling schema versions.")
+            for v, w in present.items():
+                era = "live spot" if v >= LIVE_SPOT_SCHEMA else "STALE spot"
+                print(f"    schema {v}: {w:,} windows  ({era})")
+            print("  Records before schema 3 were priced from a candle feed")
+            print("  running minutes behind the market. They measure a model")
+            print("  that could not see moves the exchange already had.")
+            print("  These are two different models; the average describes")
+            print("  neither.")
+    else:
+        try:
+            want = int(args.schema)
+        except ValueError:
+            print(f"\n  --schema must be a number or 'all', got {args.schema!r}\n")
+            return 1
+        kept = [r for r in rows if r["schema"] == want]
+        if not kept:
+            print()
+            print(f"  No schema {want} records in the log yet.")
+            if present:
+                print("  Present:")
+                for v, w in present.items():
+                    print(f"    schema {v}: {w:,} windows")
+            print(f"  Use --schema all, or --schema {max(present)} "
+                  f"to score what is there.")
+            print()
+            return 0
+        if len(kept) < len(rows):
+            other = {v: w for v, w in present.items() if v != want}
+            print()
+            print(f"  scoring schema {want} only "
+                  f"({n_windows(kept):,} windows)")
+            print(f"  excluded: " + ", ".join(
+                f"schema {v} ({w:,} windows)" for v, w in other.items()))
+            print("  use --schema all to pool them, but read the warning first")
+        rows = kept
 
     if args.no_drift:
         print("\n  (drift term zeroed; p re-derived from spot, strike, sigma)")
