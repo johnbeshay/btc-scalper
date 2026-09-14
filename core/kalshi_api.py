@@ -6,10 +6,9 @@ Read-only Kalshi market data.
     quotes = md.quotes_for_window(close)    # list[Quote] for the window closing at `close`
 
 This talks to the public market-data endpoints only. No credentials, no
-order placement. Order placement does not exist in this project yet, on
-purpose - nothing should be able to trade until the model has been shown to
-beat the price it would pay, and that measurement is what this module makes
-possible.
+order placement here. Authenticated trading lives in core/kalshi_exec.py and
+points at the demo environment; this module stays read-only so the logger can
+never accidentally trade.
 
 WHY THIS EXISTS
 ---------------
@@ -18,6 +17,23 @@ whether 70% beats what Kalshi was charging, because until now nothing wrote
 the book price down. Being calibrated is necessary. Beating the market's own
 probability, after fees, is what makes money. This module lets the logger
 record both at the same instant.
+
+FIXED-POINT FIELDS
+------------------
+Kalshi has been migrating payload fields to fixed-point strings, and the old
+integer forms are disappearing rather than changing. That failure mode is
+silent: `market.get("volume") or 0` returns 0 forever on a book that is
+trading normally, and nothing raises. This module reported volume 0 on every
+KXBTC15M market for weeks while those markets were filling orders at price
+improvement.
+
+So every reader here checks the new form first and falls back to the old:
+
+    price  -> `<field>_dollars` string, else `<field>` integer cents
+    count  -> `<field>_fp` string,      else `<field>` integer
+
+If a new field stops resolving, suspect this pattern before suspecting the
+market.
 
 SERIES TICKER
 -------------
@@ -98,6 +114,29 @@ def _price(market: dict, field: str) -> float | None:
     except (TypeError, ValueError):
         return None
     return v if v > 0 else None
+
+
+def _count(market: dict, field: str) -> int:
+    """
+    A contract count: volume, open interest, sizes.
+
+    Kalshi now sends these as fixed-point strings (`volume_fp: "328.00"`) and
+    older payloads as plain integers. Reading only the integer form reports
+    zero on a book that is trading - which is exactly what happened here, and
+    it shaped a false belief that the 15-minute BTC markets had no volume at
+    all. Fractional contracts are supported by the exchange but a whole-number
+    count is all this project needs, so the value is truncated.
+    """
+    fp = market.get(f"{field}_fp")
+    if fp not in (None, ""):
+        try:
+            return int(float(fp))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return int(market.get(field) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _strike(market: dict) -> tuple[float | None, str | None]:
@@ -206,7 +245,7 @@ def quote_from_market(market: dict, quoted_at: datetime | None = None) -> Quote 
         no_bid=_price(market, "no_bid"),
         no_ask=_price(market, "no_ask"),
         last_price=_price(market, "last_price"),
-               volume=_count(market, "volume"),
+        volume=_count(market, "volume"),
         open_interest=_count(market, "open_interest"),
         close_time=_parse_time(market.get("close_time")),
         quoted_at=quoted_at or datetime.now(timezone.utc),
