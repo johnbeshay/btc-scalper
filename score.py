@@ -541,11 +541,11 @@ def main() -> int:
                    help="re-price every row with the drift term removed")
     p.add_argument("--include-suppressed", action="store_true",
                    help="include windows the agents flagged as untradeable")
-    p.add_argument("--schema", default=str(LIVE_SPOT_SCHEMA),
-                   help=(f"record version to score: a number, or 'all'. "
-                         f"Default {LIVE_SPOT_SCHEMA} - records before that "
-                         f"were priced from a stale candle feed and measure a "
-                         f"different model."))
+    p.add_argument("--schema", default="latest",
+                   help=("record version to score: a number, 'all', or "
+                         "'latest' (default) for the newest version in the "
+                         "log. Each schema is a different model; they are "
+                         "never pooled silently."))
     args = p.parse_args()
 
     rows, total, unresolved = load(Path(args.log), zero_drift=args.no_drift)
@@ -558,6 +558,9 @@ def main() -> int:
 
     # ---- schema selection ------------------------------------------------
     present = schema_summary(rows)
+    if args.schema.lower() == "latest":
+        args.schema = str(max(present))
+        print(f"\n  scoring the newest schema in the log: {args.schema}")
     if args.schema.lower() == "all":
         if len(present) > 1:
             print()

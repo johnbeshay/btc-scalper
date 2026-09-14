@@ -79,8 +79,29 @@ from core.kalshi import estimate_vol, prob_above
 from core.kalshi_api import DEFAULT_SERIES, KalshiError, KalshiMarketData
 
 LOG = Path(__file__).parent / "predictions.jsonl"
-SCHEMA = 3
+BASIS_FILE = Path(__file__).parent / "basis.json"
+SCHEMA = 3            # live spot
+SCHEMA_BASIS = 4      # live spot + settlement basis folded into sigma
 _stop = False
+
+
+def load_basis(path: Path = BASIS_FILE) -> float:
+    """
+    The settlement basis, or 0.0 if none has been validated.
+
+    basis.json is only ever written by `python basis.py --apply`, and that
+    refuses unless the correction helped on held-out windows. So the presence
+    of the file is itself the evidence that it should be used. A missing or
+    unreadable file means price exactly as before.
+    """
+    if not path.exists():
+        return 0.0
+    try:
+        d = json.loads(path.read_text())
+        b = float(d.get("beta") or 0.0)
+        return b if b > 0 else 0.0
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        return 0.0
 
 
 def _handle_stop(signum, frame):
@@ -119,6 +140,7 @@ class Recorder:
         self._spot_warned = False
         self._settle_warned = False
         self._tickers: dict[str, set[str]] = {}   # window_id -> tickers seen
+        self.basis = load_basis()
         self.last_ladder = None  # "kalshi" or "synthetic", for the console line
 
     def _book(self, close: datetime, now: datetime):
@@ -235,8 +257,14 @@ class Recorder:
         if sigma <= 0:
             return None
 
+        # Settlement basis. Kalshi settles on a BRTI average, not the Coinbase
+        # price the model forecasts; the gap between the two is independent
+        # noise at settlement, so it adds to the forecast variance. See
+        # basis.py. Zero unless a validated basis.json exists.
+        sigma_eff = math.sqrt(sigma * sigma + self.basis * self.basis)
+
         def price(strike: float) -> tuple[float, float]:
-            p = prob_above(spot * (1 + est.drift_pct / 100), strike, sigma)
+            p = prob_above(spot * (1 + est.drift_pct / 100), strike, sigma_eff)
             sd = abs(math.log(spot / strike) / sigma) if strike != spot else 0.0
             return p, sd
 
@@ -284,7 +312,7 @@ class Recorder:
 
         record = {
             "type": "prediction",
-            "schema": SCHEMA,
+            "schema": SCHEMA_BASIS if self.basis else SCHEMA,
             "ladder": ladder,
             "market_series": self.market.series if self.market else None,
             "window_id": window_id(close),
@@ -299,6 +327,8 @@ class Recorder:
             "candle_spot": round(candle_spot, 2),
             "candle_age_min": candle_age_min,
             "sigma": round(sigma, 8),
+            "sigma_eff": round(sigma_eff, 8),
+            "basis": round(self.basis, 8),
             "base_sigma": round(est.base_sigma, 8),
             "vol_change_pct": round(est.total_vol_change_pct, 2),
             "drift_pct": round(est.drift_pct, 5),
@@ -465,6 +495,11 @@ def main() -> int:
     print(f"  Readings at T-{', T-'.join(str(h) for h in rec.horizons)} minutes")
     print("  Spot from the live ticker; candles for volatility only")
     print("  Outcomes from Kalshi settlement, not the Coinbase close")
+    if rec.basis:
+        print(f"  Settlement basis {rec.basis * 100:.3f}% folded into sigma "
+              f"(schema {SCHEMA_BASIS})")
+    else:
+        print(f"  No validated basis.json - pricing on raw sigma (schema {SCHEMA})")
     if market:
         print(f"  Kalshi book from series {market.series} (read-only, no login)")
     else:
