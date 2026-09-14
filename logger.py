@@ -42,6 +42,22 @@ the model anyone would choose to run.
 Candles are still used for volatility. Lag does not matter there: the
 question is how much price has been moving, not where it is right now.
 
+THE OUTCOME COMES FROM KALSHI, NOT COINBASE
+-------------------------------------------
+There is a third record type:
+
+    {"type": "settlement", "ticker": ..., "result": "yes"|"no", ...}
+
+It carries how the exchange actually settled the market. Kalshi resolves
+these on CF Benchmarks' BRTI as a 60-second average, not on a Coinbase
+candle close. Compared against real settlements, the candle-close proxy was
+wrong on one window in five, and the errors sat near the money. The scorer
+now grades against the settlement line when one exists and only falls back
+to the close when it does not.
+
+The outcome line is still written - it still records where price went - but
+it no longer decides who was right.
+
 Records carry "schema": 3. Older lines are still readable; the schema number
 is what distinguishes stale-spot records from live-spot ones.
 """
@@ -101,6 +117,8 @@ class Recorder:
         self._hourly_at = 0.0
         self._market_warned = False
         self._spot_warned = False
+        self._settle_warned = False
+        self._tickers: dict[str, set[str]] = {}   # window_id -> tickers seen
         self.last_ladder = None  # "kalshi" or "synthetic", for the console line
 
     def _book(self, close: datetime, now: datetime):
@@ -229,6 +247,8 @@ class Recorder:
         preds = []
         if quotes:
             ladder = "kalshi"
+            wid = window_id(close)
+            self._tickers.setdefault(wid, set()).update(q.ticker for q in quotes)
             for q in quotes:
                 p, sd = price(q.strike)
                 p_yes = p if q.yes_direction == "above" else 1 - p
@@ -327,6 +347,48 @@ class Recorder:
         append(self.path, record)
         return record
 
+    def settle(self, close: datetime, attempts: int = 4,
+               wait_s: float = 15.0) -> list[dict]:
+        """
+        Fetch how Kalshi settled this window's market(s) and record it.
+
+        Kalshi has settled these within about ten seconds of close in
+        practice, but that is not guaranteed, so this retries a few times.
+        A miss is not fatal: `python backfill.py` fills any gap later, as
+        long as the market is still in the API's window.
+        """
+        wid = window_id(close)
+        tickers = self._tickers.pop(wid, set())
+        if not tickers or self.market is None:
+            return []
+
+        written = []
+        pending = set(tickers)
+        for i in range(attempts):
+            try:
+                found = self.market.results_for(pending)
+            except Exception as exc:
+                if not self._settle_warned:
+                    print(f"  settlement lookup failed: {exc}", file=sys.stderr)
+                    self._settle_warned = True
+                found = {}
+            for t, res in found.items():
+                rec = {
+                    "type": "settlement",
+                    "window_id": wid,
+                    "ticker": t,
+                    "result": res,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
+                append(self.path, rec)
+                written.append(rec)
+            pending -= set(found)
+            if not pending:
+                break
+            if i < attempts - 1 and self._sleep(wait_s):
+                break
+        return written
+
     def run_window(self) -> None:
         now = datetime.now(timezone.utc)
         close = window_close(now)
@@ -360,6 +422,13 @@ class Recorder:
         if out:
             mark = "" if out["trustworthy"] else "   (timing off, will be excluded)"
             print(f"    close ${out['close_price']:,.2f}{mark}")
+
+        settled = self.settle(close)
+        if settled:
+            print("    kalshi settled " + ", ".join(
+                f"{r['result'].upper()}" for r in settled))
+        elif self._tickers.get(wid) is None and self.market is not None:
+            print("    settlement not available yet (backfill.py will catch it)")
 
     def _sleep(self, seconds: float) -> bool:
         """Sleep in slices so Ctrl-C is responsive. True means stop."""
@@ -395,6 +464,7 @@ def main() -> int:
     print(f"  Logging to {args.out}")
     print(f"  Readings at T-{', T-'.join(str(h) for h in rec.horizons)} minutes")
     print("  Spot from the live ticker; candles for volatility only")
+    print("  Outcomes from Kalshi settlement, not the Coinbase close")
     if market:
         print(f"  Kalshi book from series {market.series} (read-only, no login)")
     else:

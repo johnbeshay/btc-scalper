@@ -29,6 +29,22 @@ Reads predictions.jsonl, joins predictions to outcomes, and reports:
                   often those cases actually happened. n counts calls;
                   rdg counts independent readings.
 
+WHAT COUNTS AS THE RIGHT ANSWER
+-------------------------------
+`hit` now comes from Kalshi's own settlement result wherever the log has one
+(a "settlement" line for the row's ticker). Only rows without one fall back
+to the old test, Coinbase candle close versus strike.
+
+That fallback was the only source until 2026-09-14, and it was wrong on
+20.6% of windows when checked against real settlements - Kalshi resolves on
+CF Benchmarks' BRTI as a 60-second average, which is neither the same index
+nor the same kind of comparison. The disagreements sat near the money.
+Every number this tool printed before that date was graded against a
+partially wrong answer key, and the report now says how many rows are still
+on the fallback so that cannot happen silently again.
+
+Run `python backfill.py` to fetch settlements for windows already logged.
+
 TWO ERAS OF DATA
 ----------------
 Records before schema 3 were priced from Coinbase's /candles feed, which runs
@@ -108,7 +124,7 @@ def load(path: Path, zero_drift: bool = False):
     which is what core/kalshi.py says the model should do and logger.py
     historically did not. Fully offline; the log already has every input.
     """
-    preds, outs = [], {}
+    preds, outs, settled = [], {}, {}
     if not path.exists():
         return [], 0, 0
 
@@ -121,10 +137,15 @@ def load(path: Path, zero_drift: bool = False):
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if rec.get("type") == "prediction":
+            t = rec.get("type")
+            if t == "prediction":
                 preds.append(rec)
-            elif rec.get("type") == "outcome":
+            elif t == "outcome":
                 outs[rec["window_id"]] = rec
+            elif t == "settlement":
+                res = (rec.get("result") or "").lower()
+                if rec.get("ticker") and res in ("yes", "no"):
+                    settled[rec["ticker"]] = res
 
     rows, unresolved = [], 0
     for p in preds:
@@ -142,8 +163,21 @@ def load(path: Path, zero_drift: bool = False):
             if zero_drift and sigma and spot > 0 and strike > 0:
                 prob = prob_above(spot, strike, sigma)
             mkt = item.get("market") or {}
+            ticker = mkt.get("ticker")
+            direction = mkt.get("yes_direction", "above")
+
+            # Ground truth if we have it; the Coinbase proxy if we do not.
+            if ticker and ticker in settled:
+                yes_paid = settled[ticker] == "yes"
+                hit = int(yes_paid if direction == "above" else not yes_paid)
+                hit_source = "kalshi"
+            else:
+                hit = 1 if close > strike else 0
+                hit_source = "close"
+
             rows.append(
                 {
+                    "hit_source": hit_source,
                     "window_id": p["window_id"],
                     "horizon": p["horizon_min"],
                     "reading": (p["window_id"], p["horizon_min"]),
@@ -155,7 +189,7 @@ def load(path: Path, zero_drift: bool = False):
                     "p": prob,
                     "p_yes": item.get("p_yes", prob),
                     "sigmas": item["sigmas_out"],
-                    "hit": 1 if close > strike else 0,
+                    "hit": hit,
                     "spot": spot,
                     "strike": strike,
                     "close": close,
@@ -312,6 +346,19 @@ def report(rows, total_preds, unresolved):
     print(f"  the independent unit is the WINDOW: {win:,}")
     if unresolved:
         print(f"  {unresolved:,} readings excluded (no trustworthy close yet)")
+
+    kalshi_rows = sum(1 for r in rows if r.get("hit_source") == "kalshi")
+    close_rows = n - kalshi_rows
+    if close_rows == 0:
+        print(f"  outcomes: all {n:,} from Kalshi settlement")
+    elif kalshi_rows == 0:
+        print(f"  outcomes: NONE from Kalshi settlement - all {n:,} rows are on")
+        print("  the Coinbase-close proxy, which was wrong 20.6% of the time.")
+        print("  Run:  python backfill.py")
+    else:
+        print(f"  outcomes: {kalshi_rows:,} from Kalshi settlement, "
+              f"{close_rows:,} still on the Coinbase proxy")
+        print("  Run backfill.py to close that gap before trusting the totals.")
     print("=" * 64)
 
     # The floor is deliberately low now. Refusing to print was the right

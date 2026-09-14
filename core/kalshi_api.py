@@ -324,6 +324,61 @@ class KalshiMarketData:
         ]
         return sorted(hits, key=lambda q: q.strike)
 
+    # ---- settlement -----------------------------------------------------
+
+    def market(self, ticker: str) -> dict:
+        """One market by ticker, including `result` once it has settled."""
+        data = self._fetch(f"{self.base}/markets/{ticker}")
+        return data.get("market", data) or {}
+
+    def result_for(self, ticker: str) -> str | None:
+        """
+        How Kalshi settled a market: "yes", "no", or None if not yet settled.
+
+        THIS IS THE GROUND TRUTH. The scorer used to decide the outcome from
+        a Coinbase candle close. Kalshi settles these markets on CF
+        Benchmarks' BRTI - a different index, compared as a 60-second
+        average rather than a point. Measured against real settlements, the
+        Coinbase proxy was wrong on 20.6% of windows, concentrated near the
+        money where the trading is. Every score computed that way was
+        graded against the wrong answer.
+        """
+        try:
+            m = self.market(ticker)
+        except KalshiError:
+            return None
+        res = (m.get("result") or "").lower()
+        return res if res in ("yes", "no") else None
+
+    def results_for(self, tickers, statuses=("settled", "finalized", "closed")
+                    ) -> dict[str, str]:
+        """
+        Settlement results for many tickers at once.
+
+        Tries the bulk listing first (one paginated call per status), then
+        fetches any stragglers individually. Returns only tickers that have
+        actually settled; a missing key means "not yet" or "aged out", and
+        the caller should fall back rather than guess.
+        """
+        wanted = set(tickers)
+        found: dict[str, str] = {}
+        for status in statuses:
+            if not wanted - set(found):
+                break
+            try:
+                for m in self.markets(status=status):
+                    t = str(m.get("ticker", ""))
+                    res = (m.get("result") or "").lower()
+                    if t in wanted and res in ("yes", "no"):
+                        found[t] = res
+            except KalshiError:
+                continue
+        for t in wanted - set(found):
+            res = self.result_for(t)
+            if res:
+                found[t] = res
+        return found
+
     def discover_series(self, contains: str = "BTC") -> list[str]:
         """
         Best-effort list of series tickers that look like Bitcoin markets.
