@@ -354,6 +354,7 @@ def cmd_order(args) -> int:
             client_order_id=str(uuid.uuid4()),
             time_in_force=args.tif,
             exchange_index=idx,
+            post_only=args.post_only,
         )
     except KalshiError as exc:
         print(f"\n  order failed.\n  {exc}\n")
@@ -456,6 +457,8 @@ def main() -> int:
                    help="time in force")
     o.add_argument("--exchange-index", type=int, default=None,
                    help="shard override; read off the market when omitted")
+    o.add_argument("--post-only", action="store_true",
+                   help="reject instead of matching immediately (maker only)")
     o.add_argument("--yes", action="store_true", help="actually send it")
     o.set_defaults(fn=cmd_order)
 
