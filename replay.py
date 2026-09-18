@@ -50,11 +50,35 @@ FILL ASSUMPTIONS
 ----------------
     ask   pay the ask, taker fee. Realistic if there is liquidity.
     mid   pay the mid, taker fee. Optimistic; assumes someone meets you.
+    bid   rest at the bid, MAKER. Best case, and see the warning below.
 
-If the sign flips between modes, the liquidity question is the whole story.
-Note the "volume 0" belief this file was written under was a reader bug:
-these markets trade heavily (over a million contracts on some windows), so
-`ask` is the honest default and `mid` is the optimistic one.
+Kalshi's published schedule charges trading fees only on orders that match
+immediately. Resting orders pay nothing unless the series appears in the
+"Maker Fees" section - which lists GDP, payrolls, CPI, NBA, NHL, golf,
+tennis and NASCAR. KXBTC15M is not among them, so a resting order on this
+market pays no fee at all.
+
+That matters more here than anywhere else, because this model's measured
+edge is roughly 0.001 in Brier and the taker fee is about 1.75 cents per
+contract at 50 cents. Fees are not a drag on the edge; they are several
+times larger than it. `--fill bid` is the only mode in which the strategy
+has room to be profitable.
+
+But `bid` is a CEILING, not a forecast, and the gap between the two is
+adverse selection. A resting buy fills when someone sells into it, and they
+sell into it precisely when they have a reason to - when the price is about
+to fall. So the fills a resting order actually gets are worse than a random
+sample of the fills it wants. This replay cannot model that: it assumes
+every resting order fills at the quoted bid whenever the model wanted to
+trade. Real maker P&L will be lower than what `bid` reports, possibly by
+all of it.
+
+Two numbers to compare: if `ask` is negative and `bid` is positive, fees
+are the whole story and the question becomes whether resting orders fill.
+If `bid` is also negative, execution cannot save this.
+
+The fee schedule read here dates from July 2025. Check a live order ticket
+before believing the maker number.
 
 ONE TRADE PER WINDOW
 --------------------
@@ -136,9 +160,17 @@ def yes_pays(r: dict) -> float:
 
 def decide(r: dict, threshold: float, fill: str):
     ya, na, ym, nm = prices(r)
+    yb, nb = r.get("yes_bid"), r.get("no_bid")
+    if nb is None and ya is not None:
+        nb = round(1 - ya, 4)
     p_yes = r["p_yes"]
-    yes_price = ym if fill == "mid" else ya
-    no_price = nm if fill == "mid" else na
+    if fill == "mid":
+        yes_price, no_price = ym, nm
+    elif fill == "bid":
+        # Resting at the bid: you buy cheaper, and pay no fee on this series.
+        yes_price, no_price = yb, nb
+    else:
+        yes_price, no_price = ya, na
 
     best = None
     if yes_price is not None and 0 < yes_price < 1:
@@ -170,10 +202,12 @@ def simulate(rows, threshold: float, fill: str, contracts: int,
                 continue
             side, price, edge = d
             payoff = yes_pays(r) if side == "yes" else 1.0 - yes_pays(r)
+            # Maker orders on this series carry no fee; see the docstring.
+            fee = 0.0 if fill == "bid" else fees.order_fee(price, contracts)
             trades.append(Trade(
                 window_id=wid, horizon=r["horizon"], side=side,
                 contracts=contracts, price=price,
-                fee=fees.order_fee(price, contracts),
+                fee=fee,
                 claimed_edge=edge, payoff=payoff, sigmas=abs(r["sigmas"]),
             ))
             break
@@ -292,8 +326,12 @@ def report(rows, fill: str, contracts: int, fees: KalshiFees,
     print("=" * 66)
     print(f"  Replay: {len(priced):,} priced readings across "
           f"{len(train_w) + len(test_w):,} windows   (schema {schema_label})")
-    print(f"  fill at {fill}, {contracts} contracts per trade, taker fee "
-          f"{fees.taker_multiplier:.4f}")
+    fee_note = ("MAKER, no fee (resting at the bid)" if fill == "bid"
+                else f"taker fee {fees.taker_multiplier:.4f}")
+    print(f"  fill at {fill}, {contracts} contracts per trade, {fee_note}")
+    if fill == "bid":
+        print("  CEILING: assumes every resting order fills at the quoted bid.")
+        print("  Real maker fills are adversely selected and will be worse.")
     if horizon:
         print(f"  horizon T-{horizon} only")
     print(f"  split: {len(train_w)} windows to choose, {len(test_w)} to report")
@@ -492,7 +530,10 @@ def report(rows, fill: str, contracts: int, fees: KalshiFees,
 def main() -> int:
     p = argparse.ArgumentParser(description="Replay the log as trades")
     p.add_argument("--log", default=str(LOG))
-    p.add_argument("--fill", choices=["ask", "mid"], default="ask")
+    p.add_argument("--fill", choices=["ask", "mid", "bid"], default="ask",
+                   help="ask = cross the spread (taker fee); mid = optimistic "
+                        "taker; bid = rest at the bid (maker, no fee on this "
+                        "series) - a ceiling, ignores adverse selection")
     p.add_argument("--contracts", type=int, default=10)
     p.add_argument("--horizon", type=int, default=None)
     p.add_argument("--taker", type=float, default=0.07,

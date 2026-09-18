@@ -319,7 +319,7 @@ def main() -> int:
             if wid in seen:
                 # wait_for_close should make this impossible; if it happens,
                 # sleep rather than spin.
-                time.sleep(10)
+                time.sleep(10) 
                 continue
             seen.add(wid)
             run_window(rec, client, rails, state, args)
