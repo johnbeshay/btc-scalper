@@ -1,40 +1,78 @@
 """
-Automated MAKER loop. Demo or production, decided by BASE in
-core/kalshi_exec.py and nothing else.
+Watch the model trade, on demo money.
 
-    python runner.py --dry-run --once    decide, print, place nothing
     python runner.py --once              one window, then stop
     python runner.py                     keep going
+    python runner.py --maker             REST at the bid and measure fills
+    python runner.py --edge 0.10         only trade a 10-point disagreement
+    python runner.py --dry-run           decide, print, place nothing
 
-WHAT IT DOES, PER WINDOW
-------------------------
-  1. Syncs settlements into the rails state, so the loss caps see real
-     realised P&L. If any record cannot be read, the runner STOPS: a loss
-     cap fed by a sync it cannot trust is worse than no cap.
-  2. At T-horizon, prices the ladder and applies replay.decide(..., "bid")
-     to every strike - the same function the replay used, so live and
-     replay cannot silently disagree about what a trade is.
-  3. Posts ONE post-only limit order at the bid. It never crosses the
-     spread. If the exchange would have matched it immediately, the
-     exchange rejects it instead.
-  4. Watches the order until CANCEL_LEAD seconds before close, recording
-     when it filled, then cancels whatever is still resting.
+MAKER MODE IS THE POINT OF THIS FILE NOW
+----------------------------------------
+Replay says the strategy loses on taker fills and makes money on maker fills.
+The entire difference is the fee: Kalshi charges nothing on orders that rest
+rather than match, and KXBTC15M is not in the maker-fee series list.
 
-WHAT THE LOG IS FOR
--------------------
-runner.jsonl records every posted order: price, fill or no fill, seconds to
-first fill, and later the settlement. Posted-but-unfilled orders are as
-important as filled ones - comparing how the two groups would have settled
-is the adverse-selection test the replay cannot run.
+But replay's maker number is a CEILING. It assumes every resting order fills
+at the quoted bid, and that is certainly false. Two things it cannot model:
 
-PRODUCTION REQUIRES A PLAN FILE
--------------------------------
-Against production the runner will not start without live_plan.json: the
-threshold, horizon, size and budgets, written down BEFORE the first order
-and committed to git. The runner hashes the file into every log line, so a
-changed plan is visible in the record. CLI flags cannot override it.
+  fill rate         a resting buy only fills if someone sells into it. Some
+                    fraction of windows will simply pass with no trade, and
+                    an edge you cannot execute is not an edge.
 
-Demo still measures plumbing only. Demo prices do not track production.
+  adverse selection the ones that DO fill are not a random sample. Someone
+                    sells into your bid when they want out - which is when
+                    the price is about to go against you. So maker fills are
+                    systematically worse than maker quotes.
+
+Neither can be measured from the log. Both can be measured on demo, for
+free, because the matching mechanics are real even though the prices are
+not. That is what --maker does: rest at the bid, wait out the window, and
+record whether it filled, how long it took, and what happened afterwards.
+
+Run it for a week, then `python makerstats.py`.
+
+WHAT THIS IS NOT
+----------------
+Evidence about profitability. Demo prices do not track production - measured
+on one contract at one instant: demo 6.5-9.5c against production 1.7c,
+spread 3 points against 0.1, volume 939 against 1,238,784. The P&L here is
+meaningless. The FILL RATE is not: order matching works the same way, and
+fill rate is the number this cannot tell you from the log alone.
+
+WHAT THIS IS FOR
+----------------
+Seeing the model make end-to-end decisions: price a window, compare itself to
+the exchange, choose, and live with the result. That is worth watching. It is
+also the soak test the plan asks for - does auth survive hours, do shard
+balances drift, do settlements always parse, does it survive a sleep.
+
+WHAT THIS IS NOT
+----------------
+Evidence. Three separate reasons, and they stack:
+
+  1. Demo prices do not track real markets. Kalshi says so directly. The
+     first live order here filled at 0.85 on a book the production feed
+     showed at 0.91.
+
+  2. Which means the edge is computed against one book and executed against
+     another. The model prices from the REAL public Kalshi feed - that part
+     is honest - but the fill happens on demo at whatever demo felt like.
+     A profit can come entirely from that gap.
+
+  3. The model has not been shown to beat the price it would pay. Skill
+     versus market was negative in every distance band, and the adjuster
+     fixes have almost no data behind them.
+
+So a green number here means the plumbing works. It does not mean the model
+works, and it must not move the Phase C gate. That decision belongs to
+score.py and replay.py on real logged data.
+
+IT WRITES ITS OWN LOG
+---------------------
+runner.jsonl, never predictions.jsonl. Two processes appending to one file
+interleave and corrupt it, and the evidence file belongs to the logger alone.
+Nothing from demo ever flows back into the record that gets scored.
 """
 
 from __future__ import annotations
@@ -48,25 +86,14 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import hashlib
-
 from core import rails as R
-from core import reconcile
-from core.kalshi_exec import (BASE, CREDS_FILENAME, IS_DEMO, Credentials,
-                              DemoClient, KalshiError)
+from core.kalshi_exec import Credentials, DemoClient, KalshiError
 from core.kalshi_api import DEFAULT_SERIES, KalshiMarketData
 from logger import Recorder, window_close, window_id
-from replay import decide
 
 HERE = Path(__file__).parent
 RUNNER_LOG = HERE / "runner.jsonl"
-CREDS = HERE / CREDS_FILENAME
-PLAN_FILE = HERE / "live_plan.json"
-
-POLL_SEC = 5          # how often to check a resting order
-CANCEL_LEAD = 30      # cancel anything still resting this long before close
-PLAN_FIELDS = ("threshold", "horizon", "count", "max_total_loss",
-               "max_daily_loss")
+CREDS = HERE / "kalshi-demo-credentials.json"
 
 _stop = False
 
@@ -85,16 +112,18 @@ def yes_mid(market: dict) -> float | None:
     return ask if ask is not None else bid
 
 
-def choose(record: dict, threshold: float) -> dict | None:
+def choose(record: dict, min_edge: float, maker: bool = False) -> dict | None:
     """
-    The maker decision, per strike, using replay.decide(fill="bid").
+    Pick the strike where the model disagrees with the book the most.
 
-    Edge is measured against the price actually paid - the bid - not the
-    mid, because that is what replay measured and what the P&L depends on.
-    Of the strikes that clear the threshold, take the largest edge.
+    Returns None when nothing clears the threshold, when the window is
+    suppressed, or when no contract has a price to disagree with.
 
-    Buying NO at the NO bid is sent as an ask on YES at 100 - no_bid, which
-    rests at the YES ask. Both sides are maker orders; neither crosses.
+    A note on the threshold, because it is the one knob here and the obvious
+    instinct is wrong: in the logged data the win rate FELL as the claimed
+    edge rose - 58% down to 8%. When this model strongly disagreed with the
+    book, the book was right. So a bigger --edge is not a safer setting. It
+    selects for exactly the cases that have gone worst.
     """
     if record.get("suppressed"):
         return None
@@ -104,138 +133,43 @@ def choose(record: dict, threshold: float) -> dict | None:
         m = p.get("market")
         if not m or not m.get("ticker"):
             continue
-        row = {"p_yes": p["p_yes"], "yes_bid": m.get("yes_bid"),
-               "yes_ask": m.get("yes_ask"), "no_bid": m.get("no_bid"),
-               "no_ask": m.get("no_ask")}
-        d = decide(row, threshold, "bid")
-        if d is None:
+        mid = yes_mid(m)
+        if mid is None:
             continue
-        side, price, edge = d
-        cents = int(round(price * 100))
-        if not (1 <= cents <= 99):
-            continue
-        if best is None or edge > best["edge"]:
+
+        edge = p["p_yes"] - mid
+        if best is None or abs(edge) > abs(best["edge"]):
             best = {
-                "ticker": m["ticker"], "strike": p["strike"],
-                "p_yes": p["p_yes"], "side": side, "price_cents": cents,
-                "edge": edge, "yes_bid": m.get("yes_bid"),
-                "yes_ask": m.get("yes_ask"), "quoted_at": m.get("quoted_at"),
+                "ticker": m["ticker"],
+                "strike": p["strike"],
+                "p_yes": p["p_yes"],
+                "mid": mid,
+                "edge": edge,
+                "yes_ask": m.get("yes_ask"),
+                "no_ask": m.get("no_ask"),
+                "yes_bid": m.get("yes_bid"),
+                "no_bid": m.get("no_bid"),
+                "quoted_at": m.get("quoted_at"),
             }
+
+    if best is None or abs(best["edge"]) < min_edge:
+        return None
+
+    # Buy the side the model thinks is cheap.
+    #
+    # Taker: pay the ask, fills now, pays the fee.
+    # Maker: rest at the bid, pays no fee on this series, may never fill.
+    if best["edge"] > 0:
+        best["side"] = "yes"
+        price = best["yes_bid"] if maker else best["yes_ask"]
+    else:
+        best["side"] = "no"
+        price = best["no_bid"] if maker else best["no_ask"]
+
+    if price is None:
+        return None
+    best["price_cents"] = int(round(price * 100))
     return best
-
-
-def _num(v) -> float | None:
-    """Kalshi sends counts as ints or fixed-point strings. None if neither."""
-    if v is None:
-        return None
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def read_order(resp: dict) -> dict:
-    """
-    (filled, remaining, status) from an order or create-order response.
-
-    Field names differ between endpoints and API versions, so several are
-    tried. Anything unreadable comes back None - never 0 - because "we do
-    not know whether it filled" must not be recorded as "it did not fill".
-    """
-    o = resp.get("order", resp) if isinstance(resp, dict) else {}
-    filled = _num(o.get("fill_count_fp", o.get("fill_count")))
-    remaining = _num(o.get("remaining_count_fp", o.get("remaining_count")))
-    return {"filled": filled, "remaining": remaining,
-            "status": o.get("status")}
-
-
-def watch_order(client, order_id: str, deadline: datetime,
-                count: int, now=None, sleep=None, root: Path = HERE) -> dict:
-    """
-    Poll a resting order until it is fully filled or the deadline passes,
-    then cancel what remains. `now` and `sleep` are injectable for tests.
-
-    If the order cannot be read or cancelled, the kill switch is set. An
-    order this loop can no longer see or control is the moment to stop.
-    """
-    now = now or (lambda: datetime.now(timezone.utc))
-    sleep = sleep or _sleep
-    posted = now()
-    out = {"order_id": order_id, "first_fill_after_s": None,
-           "filled": 0.0, "cancelled": False, "problem": None}
-
-    while now() < deadline:
-        try:
-            st = read_order(client.order(order_id))
-        except KalshiError as exc:
-            out["problem"] = f"could not read order: {exc}"
-            break
-        if st["filled"] is None:
-            out["problem"] = f"unreadable order state: {st}"
-            break
-        if st["filled"] > out["filled"] and out["first_fill_after_s"] is None:
-            out["first_fill_after_s"] = round((now() - posted).total_seconds(), 1)
-        out["filled"] = st["filled"]
-        if st["filled"] >= count:
-            return out
-        if st["status"] in ("canceled", "cancelled", "executed", "expired"):
-            return out
-        if sleep(POLL_SEC):
-            break                                 # Ctrl-C: still cancel below
-
-    try:
-        client.cancel(order_id)
-        out["cancelled"] = True
-        # A fill can land between the last poll and the cancel. Read once more.
-        st = read_order(client.order(order_id))
-        if st["filled"] is not None:
-            if st["filled"] > out["filled"] and out["first_fill_after_s"] is None:
-                out["first_fill_after_s"] = round(
-                    (now() - posted).total_seconds(), 1)
-            out["filled"] = st["filled"]
-    except KalshiError as exc:
-        out["problem"] = (out["problem"] or "") + f" cancel failed: {exc}"
-
-    if out["problem"]:
-        (Path(root) / R.KILL_FILE).write_text(
-            f"set by runner at {now().isoformat()}: {out['problem']}\n")
-    return out
-
-
-def load_plan(path: Path = PLAN_FILE) -> tuple[dict, str]:
-    """
-    The pre-committed plan, and a short hash of its exact bytes.
-
-    Refuses on a missing file, a missing field, or a null - so the plan
-    cannot be half-written and "filled in later" after seeing results.
-    """
-    if not path.exists():
-        raise SystemExit(f"  no {path.name}. Copy live_plan.example.json, "
-                         "fill it in, commit it, then start.")
-    raw = path.read_bytes()
-    plan = json.loads(raw)
-    missing = [k for k in PLAN_FIELDS if plan.get(k) is None]
-    if missing:
-        raise SystemExit(f"  {path.name} is missing: {', '.join(missing)}")
-    if plan["count"] != 1:
-        raise SystemExit("  count must be 1 for this experiment.")
-    return plan, hashlib.sha256(raw).hexdigest()[:12]
-
-
-def sync_pnl(client, state) -> bool:
-    """Fold new settlements into realised P&L. False if anything was unreadable."""
-    settlements = client.settlements().get("settlements") or []
-    fills = client.fills().get("fills") or []
-    report = reconcile.sync(state, settlements, fills, apply=True)
-    if report.applied:
-        print(f"   settled: {report.total_applied:+.2f}   "
-              f"today {state.pnl_today():+.2f}   total {state.pnl_total():+.2f}")
-    if not report.clean:
-        print("   SYNC NOT CLEAN - unreadable settlement or fee records.")
-        print("   Stopping: the loss caps cannot be trusted. Run")
-        print("   `python executor.py sync --raw` and fix the field mapping.")
-        return False
-    return True
 
 
 def wait_for_close(close: datetime) -> bool:
@@ -281,8 +215,73 @@ def check_spot_freshness(rec: Recorder) -> None:
         print("   in this project is wrong.")
 
 
+def poll_until_close(client, order_id: str, close: datetime,
+                     every: float = 15.0) -> dict:
+    """
+    Watch one resting order until the window closes.
+
+    Returns what happened: filled (with the wait in seconds and the price),
+    or still resting at close, in which case it is cancelled.
+
+    The wait time matters as much as the fill itself. An order that fills in
+    ten seconds filled because the quote was already stale; one that fills
+    after nine minutes filled because the market came to it. Those are
+    different trades wearing the same label.
+    """
+    started = datetime.now(timezone.utc)
+    last = {}
+    while True:
+        remaining = (close - datetime.now(timezone.utc)).total_seconds()
+        if remaining <= 5 or _stop:
+            break
+        if _sleep(min(every, max(remaining - 5, 1))):
+            break
+        try:
+            orders = (client.orders().get("orders") or [])
+        except KalshiError as exc:
+            print(f"   poll failed: {exc}")
+            continue
+        mine = next((o for o in orders if o.get("order_id") == order_id), None)
+        if mine is None:
+            # Gone from the book entirely - treat as filled and confirm below.
+            last = {}
+            break
+        last = mine
+        filled = float(mine.get("fill_count") or 0)
+        if filled > 0 and float(mine.get("remaining_count") or 0) == 0:
+            break
+
+    waited = (datetime.now(timezone.utc) - started).total_seconds()
+
+    # Confirm against fills rather than trusting the order row.
+    try:
+        fills = [f for f in (client.fills().get("fills") or [])
+                 if f.get("order_id") == order_id]
+    except KalshiError:
+        fills = []
+
+    if fills:
+        return {
+            "filled": True,
+            "waited_sec": round(waited, 1),
+            "fill_price": fills[0].get("yes_price_dollars"),
+            "fee": fills[0].get("fee_cost"),
+            "count": fills[0].get("count_fp"),
+        }
+
+    # Never filled. Cancel so it cannot settle against us after close.
+    try:
+        client.cancel(order_id)
+        cancelled = True
+    except KalshiError as exc:
+        cancelled = False
+        print(f"   cancel failed: {exc}")
+    return {"filled": False, "waited_sec": round(waited, 1),
+            "cancelled": cancelled,
+            "remaining": last.get("remaining_count")}
+
+
 def run_window(rec: Recorder, client, rails, state, args) -> None:
-    global _stop
     now = datetime.now(timezone.utc)
     close = window_close(now)
     wid = window_id(close)
@@ -296,10 +295,6 @@ def run_window(rec: Recorder, client, rails, state, args) -> None:
         wait_for_close(close)
         return
     if wait > 0 and _sleep(wait):
-        return
-
-    if client is not None and not sync_pnl(client, state):
-        _stop = True
         return
 
     check_spot_freshness(rec)
@@ -319,36 +314,34 @@ def run_window(rec: Recorder, client, rails, state, args) -> None:
         wait_for_close(close)
         return
 
-    pick = choose(record, args.threshold)
+    pick = choose(record, args.edge, maker=args.maker)
     if not pick:
-        print(f"   nothing over {args.threshold:.0%} edge at the bid; standing down")
-        log(dict(window_id=wid, action="no_trade", plan=args.plan_hash))
+        print(f"   nothing over {args.edge:.0%} edge; standing down")
         wait_for_close(close)
         return
 
     print(f"   {pick['ticker']}  strike {pick['strike']:,.0f}")
-    print(f"   model p_yes {pick['p_yes']:.3f}   book {pick['yes_bid']}/"
-          f"{pick['yes_ask']}   edge at bid {pick['edge']:+.3f}")
-    print(f"   -> rest: buy {args.count} {pick['side']} @ {pick['price_cents']}c"
-          f" (post-only)")
+    print(f"   model {pick['p_yes']:.3f} vs book {pick['mid']:.3f}"
+          f"   edge {pick['edge']:+.3f}")
+    how = "REST at" if args.maker else "take at"
+    print(f"   -> buy 1 {pick['side']} {how} {pick['price_cents']}c")
 
     decision = R.check(
         rails=rails, state=state, window_id=wid, suppressed=record["suppressed"],
         quoted_at=pick["quoted_at"], price_cents=pick["price_cents"],
-        count=args.count, root=HERE,
+        count=1, root=HERE,
     )
     if not decision:
         print("   REFUSED")
         for r in decision.reasons:
             print(f"     - {r}")
-        log(dict(window_id=wid, action="refused", reasons=decision.reasons,
-                 plan=args.plan_hash, **pick))
+        log(dict(window_id=wid, action="refused", reasons=decision.reasons, **pick))
         wait_for_close(close)
         return
 
     if args.dry_run:
         print("   dry run, not sent")
-        log(dict(window_id=wid, action="dry_run", plan=args.plan_hash, **pick))
+        log(dict(window_id=wid, action="dry_run", **pick))
         wait_for_close(close)
         return
 
@@ -356,46 +349,39 @@ def run_window(rec: Recorder, client, rails, state, args) -> None:
         idx = client.exchange_index_for(pick["ticker"])
         result = client.place_limit(
             ticker=pick["ticker"], side=pick["side"], action="buy",
-            count=args.count, price_cents=pick["price_cents"],
+            count=1, price_cents=pick["price_cents"],
             client_order_id=str(uuid.uuid4()),
-            time_in_force="good_till_canceled",
-            exchange_index=idx, post_only=True,
+            time_in_force=("good_till_canceled" if args.maker
+                           else "immediate_or_cancel"),
+            exchange_index=idx,
         )
     except KalshiError as exc:
-        # A post-only rejection lands here too. That is the order refusing
-        # to become a taker, which is correct; it is logged, not retried.
-        print(f"   order not placed: {exc}")
-        log(dict(window_id=wid, action="rejected", error=str(exc),
-                 plan=args.plan_hash, **pick))
+        print(f"   order failed: {exc}")
+        log(dict(window_id=wid, action="error", error=str(exc), **pick))
         wait_for_close(close)
         return
 
     state.record_order(wid)
-    posted_at = datetime.now(timezone.utc)
-    first = read_order(result)
-    order_id = result.get("order_id") or (result.get("order") or {}).get("order_id")
-    if first["filled"]:
-        # Should be impossible with post_only. If it happens, post_only is
-        # not doing what the docs said, and every fill so far may be a taker.
-        print(f"   WARNING: filled {first['filled']} on placement - that is a "
-              "TAKER fill. post_only is not working. Setting kill switch.")
-        (HERE / R.KILL_FILE).write_text("immediate fill on a post-only order\n")
 
-    print(f"   resting, order {order_id}; watching until T-{CANCEL_LEAD}s")
-    outcome = watch_order(client, order_id,
-                          close - timedelta(seconds=CANCEL_LEAD), args.count)
+    if not args.maker:
+        filled = result.get("fill_count")
+        print(f"   filled {filled} @ {result.get('average_fill_price')}"
+              f"  fee {result.get('average_fee_paid')}")
+        log(dict(window_id=wid, action="sent", result=result, **pick))
+        wait_for_close(close)
+        return
+
+    # Maker: the order is resting. Watch it.
+    order_id = result.get("order_id")
+    print(f"   resting  order_id {order_id}")
+    outcome = poll_until_close(client, order_id, close)
     if outcome["filled"]:
-        print(f"   FILLED {outcome['filled']:g} after "
-              f"{outcome['first_fill_after_s']}s")
+        print(f"   FILLED after {outcome['waited_sec']:.0f}s "
+              f"@ {outcome.get('fill_price')}  fee {outcome.get('fee')}")
     else:
-        print("   no fill; cancelled" if outcome["cancelled"]
-              else "   no fill")
-    if outcome["problem"]:
-        print(f"   PROBLEM: {outcome['problem']} - kill switch set")
-
-    log(dict(window_id=wid, action="posted", plan=args.plan_hash,
-             posted_at=posted_at.isoformat(), immediate_fill=first["filled"],
-             create_response=result, **outcome, **pick))
+        print(f"   never filled ({outcome['waited_sec']:.0f}s), cancelled")
+    log(dict(window_id=wid, action="maker", result=result,
+             outcome=outcome, **pick))
     wait_for_close(close)
 
 
@@ -415,71 +401,55 @@ def _sleep(seconds: float) -> bool:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Maker loop (demo or production)")
+    p = argparse.ArgumentParser(description="Watch the model trade on demo")
     p.add_argument("--once", action="store_true")
     p.add_argument("--dry-run", action="store_true",
                    help="decide and print, place nothing")
-    p.add_argument("--edge", type=float, default=None,
-                   help="DEMO ONLY: threshold override (production reads the plan)")
-    p.add_argument("--horizon", type=int, default=None,
-                   help="DEMO ONLY: horizon override (production reads the plan)")
+    p.add_argument("--maker", action="store_true",
+                   help="rest at the bid instead of crossing the spread, and "
+                        "measure whether it fills")
+    p.add_argument("--edge", type=float, default=0.05,
+                   help="minimum |model - book| to act on (default 0.05)")
+    p.add_argument("--horizon", type=int, default=4,
+                   help="minutes before close to decide")
     p.add_argument("--series", default=DEFAULT_SERIES)
     args = p.parse_args()
 
     signal.signal(signal.SIGINT, _handle_stop)
 
-    if IS_DEMO:
-        plan, args.plan_hash = ({}, "demo")
-        if PLAN_FILE.exists():
-            plan, args.plan_hash = load_plan()
-        args.threshold = args.edge if args.edge is not None else plan.get("threshold", 0.05)
-        args.horizon = args.horizon if args.horizon is not None else plan.get("horizon", 4)
-        args.count = 1
-        rails = R.Rails()
-    else:
-        if args.edge is not None or args.horizon is not None:
-            print("  --edge and --horizon are refused against production.")
-            print("  The plan file is the only source of those numbers.")
-            return 1
-        plan, args.plan_hash = load_plan()
-        args.threshold, args.horizon = plan["threshold"], plan["horizon"]
-        args.count = plan["count"]
-        rails = R.Rails(max_total_loss=plan["max_total_loss"],
-                        max_daily_loss=plan["max_daily_loss"])
-
     rec = Recorder(RUNNER_LOG.with_name("runner_predictions.jsonl"),
                    horizons=(args.horizon,),
                    market=KalshiMarketData(series=args.series))
-    state = R.State(HERE / R.STATE_FILE)
 
-    env = "DEMO" if IS_DEMO else "*** PRODUCTION - REAL MONEY ***"
-    print(f"\n  environment: {env}\n  endpoint:    {BASE}")
+    rails = R.Rails()
+    state = R.State(HERE / R.STATE_FILE)
 
     client = None
     if not args.dry_run:
         try:
             client = DemoClient(Credentials.from_file(CREDS))
             bal = client.balance()
-            print(f"  balance ${(bal.get('balance') or 0) / 100:,.2f}")
+            print(f"  demo balance ${(bal.get('balance') or 0) / 100:,.2f}")
         except KalshiError as exc:
             print(f"  {exc}")
             return 1
 
-    if IS_DEMO:
-        print("  Demo prices do not track production: this tests plumbing only.")
-    print(f"  plan {args.plan_hash}: threshold {args.threshold:.0%} at the bid, "
-          f"T-{args.horizon}, {args.count} contract")
-    print(f"  loss caps: ${rails.max_daily_loss:.2f}/day, "
-          f"${rails.max_total_loss:.2f} total "
-          f"(spent so far {state.pnl_total():+.2f})")
-    print(f"  kill switch: create {HERE / R.KILL_FILE}")
-    print("  Ctrl-C stops after the current window (resting orders are cancelled).")
+    print("  DEMO ONLY. Demo prices do not track real markets, so the P&L")
+    print("  here measures the plumbing, not the model.")
+    mode = ("MAKER - resting at the bid, measuring fill rate"
+            if args.maker else "TAKER - crossing the spread")
+    print(f"  {mode}")
+    print(f"  edge threshold {args.edge:.0%}, deciding at T-{args.horizon}")
+    print(f"  writing to {RUNNER_LOG.name} (predictions.jsonl untouched)")
+    print("  Ctrl-C to stop after the current window.")
 
     seen: set[str] = set()
     while not _stop:
         try:
             wid = window_id(window_close(datetime.now(timezone.utc)))
             if wid in seen:
+                # wait_for_close should make this impossible; if it happens,
+                # sleep rather than spin.
                 time.sleep(10)
                 continue
             seen.add(wid)
