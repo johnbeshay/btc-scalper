@@ -82,8 +82,27 @@ class RailsTest(unittest.TestCase):
         self.assertTrue(R.check(**base_kwargs(self.state, self.root)))
 
     def test_yesterdays_loss_does_not_block_today(self):
-        self.state.record_pnl(-50.0, day="2026-09-12")
+        # Over yesterday's daily cap, under the lifetime budget.
+        self.state.record_pnl(-15.0, day="2026-09-12")
         self.assertTrue(R.check(**base_kwargs(self.state, self.root)))
+
+    def test_loss_budget_blocks_across_days(self):
+        # No single day hits the daily cap; together they spend the budget.
+        for day in ("2026-09-10", "2026-09-11", "2026-09-12"):
+            self.state.record_pnl(-9.0, day=day)
+        d = R.check(**base_kwargs(self.state, self.root))
+        self.assertFalse(d)
+        self.assertTrue(any("loss budget spent" in r for r in d.reasons))
+
+    def test_loss_budget_counts_wins_against_losses(self):
+        self.state.record_pnl(-20.0, day="2026-09-11")
+        self.state.record_pnl(+10.0, day="2026-09-12")
+        self.assertTrue(R.check(**base_kwargs(self.state, self.root)))
+
+    def test_loss_budget_survives_a_restart(self):
+        self.state.record_pnl(-26.0, day="2026-09-01")
+        reloaded = R.State(self.state.path)
+        self.assertFalse(R.check(**base_kwargs(reloaded, self.root)))
 
     def test_pnl_survives_a_restart(self):
         path = self.root / "state.json"

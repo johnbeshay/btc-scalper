@@ -13,6 +13,9 @@ THE SIX RAILS
   4. SUPPRESSED       the model itself flagged this window as untrustworthy.
   5. STALE BOOK       the quote is older than the freshness bound.
   6. NOTIONAL CAP     the dollar size of this single order.
+  7. LOSS BUDGET      realised losses across ALL days, against the total
+                      the experiment was allowed to lose. Once spent, the
+                      experiment is over; it does not reset at midnight.
 
 WHY A FILE FOR THE KILL SWITCH
 ------------------------------
@@ -57,6 +60,7 @@ class Rails:
     basis while the model has never beaten the market price.
     """
     max_daily_loss: float = 10.00       # dollars, realised, per UTC day
+    max_total_loss: float = 25.00       # dollars, realised, all days combined
     max_orders_per_window: int = 1
     max_notional: float = 5.00          # dollars, one order
     max_book_age_sec: float = 30.0
@@ -122,6 +126,9 @@ class State:
 
     def pnl_today(self, day: str | None = None) -> float:
         return float(self.data["daily_pnl"].get(day or utc_day(), 0.0))
+
+    def pnl_total(self) -> float:
+        return round(sum(float(v) for v in self.data["daily_pnl"].values()), 4)
 
     def orders_in_window(self, window_id: str) -> int:
         return int(self.data["window_orders"].get(window_id, 0))
@@ -202,6 +209,15 @@ def check(
         reasons.append(
             f"daily loss cap hit: {pnl:+.2f} on {today}, "
             f"limit {-abs(rails.max_daily_loss):.2f}"
+        )
+
+    # 7. lifetime loss budget (numbered as added; checked early because it
+    #    is the one that ends the experiment rather than the day)
+    total = state.pnl_total()
+    if total <= -abs(rails.max_total_loss):
+        reasons.append(
+            f"loss budget spent: {total:+.2f} all-time, "
+            f"budget {-abs(rails.max_total_loss):.2f}"
         )
 
     # 3. per-window cap

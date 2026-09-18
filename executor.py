@@ -12,6 +12,7 @@ Demo executor. Manual, one order at a time.
   python executor.py sync                     see what settled (writes nothing)
   python executor.py sync --apply             fold it into realised P&L
   python executor.py pnl --amount -1.25       record a result by hand
+  python executor.py fees                     the series' own fee terms
 
 WHAT THIS DELIBERATELY DOES NOT DO
 ----------------------------------
@@ -46,6 +47,7 @@ from core import rails as R
 from core import reconcile
 from core.kalshi_exec import (
     BASE,
+    CREDS_FILENAME,
     IS_DEMO,
     Credentials,
     DemoClient,
@@ -53,7 +55,7 @@ from core.kalshi_exec import (
 )
 
 HERE = Path(__file__).parent
-CREDS_FILE = HERE / "kalshi-demo-credentials.json"
+CREDS_FILE = HERE / CREDS_FILENAME
 
 
 def banner() -> None:
@@ -382,6 +384,38 @@ def cmd_order(args) -> int:
     return 0
 
 
+def cmd_fees(args) -> int:
+    """
+    Print every fee-related field the exchange reports for the series.
+
+    Deliberately prints raw keys rather than interpreting them: the fee
+    schedule changed in 2026 to per-series multipliers, and a parser written
+    against a guess of the field names would be exactly the kind of code that
+    returns a plausible zero. Read what comes back.
+    """
+    banner()
+    try:
+        client = connect()
+        resp = client.series(args.series)
+    except KalshiError as exc:
+        print(f"  {exc}\n")
+        return 1
+    series = resp.get("series", resp)
+    fee_keys = {k: v for k, v in series.items() if "fee" in k.lower()}
+    print(f"  series {args.series}")
+    if not fee_keys:
+        print("  no fee fields found. Full record, to look for them:")
+        print("  " + json.dumps(series, indent=2)[:1200].replace("\n", "\n  "))
+    for k, v in fee_keys.items():
+        print(f"  {k:<28} {v}")
+    print()
+    print("  The maker thesis needs this series to charge nothing on resting")
+    print("  orders. If a maker fee or multiplier appears above, re-run replay")
+    print("  with it before going live.")
+    print()
+    return 0
+
+
 def cmd_cancel(args) -> int:
     banner()
     try:
@@ -448,6 +482,10 @@ def main() -> int:
     n = sub.add_parser("pnl", help="record a realised result by hand")
     n.add_argument("--amount", type=float, required=True)
     n.set_defaults(fn=cmd_pnl)
+
+    f = sub.add_parser("fees", help="series fee terms from the exchange")
+    f.add_argument("--series", default="KXBTC15M")
+    f.set_defaults(fn=cmd_fees)
 
     args = p.parse_args()
     return args.fn(args)

@@ -1,0 +1,11 @@
+{
+  "written_at": "YYYY-MM-DD, before the first production order",
+  "purpose": "measure maker fill rate, adverse selection, and real fees at minimum size",
+  "threshold": null,
+  "horizon": 4,
+  "count": 1,
+  "max_daily_loss": 10.0,
+  "max_total_loss": 25.0,
+  "stop_after_fills": 30,
+  "decision_rule": "scale only if held-out maker P&L on real fills has its whole CI above zero and filled trades do not settle worse than posted-but-unfilled ones"
+}

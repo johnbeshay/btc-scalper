@@ -50,6 +50,12 @@ BASE = "https://external-api.demo.kalshi.co/trade-api/v2"
 IS_DEMO = "demo" in BASE
 TIMEOUT = 15
 
+# Credentials follow the endpoint, never a flag. Editing BASE is the only way
+# to reach production, and it also switches which key file gets loaded, so a
+# demo key can never be sent to production or the other way round by accident.
+CREDS_FILENAME = ("kalshi-demo-credentials.json" if IS_DEMO
+                  else "kalshi-prod-credentials.json")
+
 
 class KalshiError(RuntimeError):
     """An API call failed."""
@@ -221,6 +227,18 @@ class DemoClient:
         """
         return self._request("GET", f"/trade-api/v2/markets/{ticker}")
 
+    def order(self, order_id: str) -> dict:
+        """One order's current state: fills so far, what is still resting."""
+        return self._request("GET", f"/trade-api/v2/portfolio/orders/{order_id}")
+
+    def series(self, series_ticker: str) -> dict:
+        """
+        Series metadata. Carries the fee terms for the series (fee type and
+        multiplier) - the only fee source that is specific to KXBTC15M rather
+        than to the exchange in general. Read it; do not assume it.
+        """
+        return self._request("GET", f"/trade-api/v2/series/{series_ticker}")
+
     def exchange_index_for(self, ticker: str) -> int | None:
         m = self.market(ticker)
         return (m.get("market", m) or {}).get("exchange_index")
@@ -267,7 +285,8 @@ class DemoClient:
                     count: int, price_cents: int,
                     client_order_id: str,
                     time_in_force: str = "good_till_canceled",
-                    exchange_index: int | None = None) -> dict:
+                    exchange_index: int | None = None,
+                    post_only: bool = False) -> dict:
         """
         One limit order, via the V2 endpoint.
 
@@ -289,9 +308,17 @@ class DemoClient:
         cents: "1.00" and "0.23". Sending ints here is accepted by json and
         rejected by the exchange.
 
-        Limit only, never market. A market order on a book with no depth -
-        and KXBTC15M has shown zero volume every time it has been checked -
-        can fill anywhere. The limit price is the one guarantee available.
+        Limit only, never market. The limit price is the one guarantee
+        available.
+
+        POST ONLY
+        ---------
+        `post_only=True` asks the exchange to reject the order rather than
+        let it match immediately. That is what makes a maker order a maker
+        order: without it, a book that moves between reading and sending can
+        turn a resting bid into a taker fill that pays the fee. The field
+        name was taken from the documentation; confirm on demo that an order
+        priced through the book is REJECTED, not filled, before trusting it.
         """
         if side not in ("yes", "no"):
             raise KalshiError(f"side must be yes or no, got {side!r}")
@@ -318,6 +345,8 @@ class DemoClient:
         }
         if exchange_index is not None:
             body["exchange_index"] = exchange_index
+        if post_only:
+            body["post_only"] = True
         return self._request("POST", "/trade-api/v2/portfolio/events/orders", body)
 
     def cancel(self, order_id: str) -> dict:
