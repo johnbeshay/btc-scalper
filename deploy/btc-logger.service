@@ -1,0 +1,36 @@
+[Unit]
+Description=btc-scalper predictions logger
+Documentation=https://github.com/johnbeshay/btc-scalper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scalper
+WorkingDirectory=/home/scalper/btc-scalper
+ExecStart=/home/scalper/btc-scalper/.venv/bin/python logger.py
+
+# The logger has died twice on a laptop and every dead minute is a window
+# that never gets collected. Restart unconditionally, including after a
+# clean exit - a clean exit is not a reason to stop logging.
+Restart=always
+RestartSec=20
+
+# Don't give up after repeated failures. The default (5 restarts in 10s
+# gives up permanently) would turn a brief network outage into a silent
+# permanent stop, which is the exact failure this deployment exists to fix.
+StartLimitIntervalSec=0
+
+StandardOutput=append:/home/scalper/btc-scalper/logs/logger.out
+StandardError=append:/home/scalper/btc-scalper/logs/logger.err
+
+# predictions.jsonl is the only copy of the evidence. Nothing else on the
+# box needs write access to anything outside the project directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/scalper/btc-scalper
+
+[Install]
+WantedBy=multi-user.target

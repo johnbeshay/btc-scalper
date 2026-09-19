@@ -1,0 +1,27 @@
+[Unit]
+Description=btc-scalper maker runner (demo)
+Documentation=https://github.com/johnbeshay/btc-scalper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scalper
+WorkingDirectory=/home/scalper/btc-scalper
+ExecStart=/home/scalper/btc-scalper/.venv/bin/python runner.py
+
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=0
+
+StandardOutput=append:/home/scalper/btc-scalper/logs/runner.out
+StandardError=append:/home/scalper/btc-scalper/logs/runner.err
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/scalper/btc-scalper
+
+[Install]
+WantedBy=multi-user.target
