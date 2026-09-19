@@ -4,10 +4,41 @@
 
 **Phase A (replay simulator): done, and it finally works correctly.**
 **Phase B (demo executor): built and verified end to end on demo money.**
-**Phase C (live): still gated. Not close, but closer than it was.**
+**Phase C (live): the CODE is finished and well guarded. The EVIDENCE is not.**
 
 The headline changed this session. On taker fills the model loses; on maker
 fills it does not. That is the whole live question now.
+
+`runner.py` is a maker-only loop that already handles production properly:
+post-only orders that are rejected rather than allowed to cross, a kill
+switch that trips if an order cannot be read or cancelled, a settlement sync
+before every window that stops the loop if any record is unreadable, and a
+`live_plan.json` whose hash is written into every log line so a threshold
+cannot be changed after seeing results. It calls `replay.decide(..., "bid")`
+directly, so live and replay cannot drift apart about what counts as a trade.
+
+Nothing about going live is a coding problem any more. Two numbers are
+missing, and `runner.py` on demo collects both.
+
+**Both processes now run on a DigitalOcean droplet, not the laptop.**
+`143.244.153.120`, Ubuntu 24.04, $6/mo. The logger had died twice and the
+network dropped once on the laptop, and every gap is permanent - Kalshi does
+not serve historical order books, so a missing window can never be
+recovered. See `deploy/README.md`.
+
+Check it from anywhere, including a phone over SSH (Termius):
+
+    ssh root@143.244.153.120
+    scalper-health
+
+The **last write** line is the one that matters. A window closes every 15
+minutes, so anything over 20 means something is wrong and the output names
+the `journalctl` command to run.
+
+Note the server started its log from zero on 2026-09-19. The laptop's
+`predictions.jsonl` holds the 299 schema-3 windows described below. Two
+separate files for now; decide later whether to merge or let the server's
+continuous log stand on its own.
 
 ---
 
@@ -119,10 +150,55 @@ relying on it.**
 | `diagnose.py` | two sanity checks: does disagreement track the missed move; does Coinbase agree with settlement. |
 | `disagree.py` | anatomy of high-disagreement windows — what differs about them. |
 | `executor.py` | manual demo orders. Six rails, kill switch, `sync` derives P&L from settlements. |
-| `runner.py` | automated demo loop. Real book in, demo orders out, own log. |
+| `runner.py` | maker-only loop, demo or production. Post-only at the bid, order watching, plan file with hash, loss budgets, fee check. |
+| `makerstats.py` | reads runner.jsonl: fill rate, wait times, adverse selection. |
 | `shardcheck.py` | per-shard balance and a market's `exchange_index`. |
+| `deploy/` | systemd units, `setup.sh`, `health.sh`. See `deploy/README.md`. |
 
 ~309 tests, stdlib only except `cryptography` (isolated to `core/kalshi_auth.py`).
+
+---
+
+## THE SERVER
+
+| | |
+|---|---|
+| host | `143.244.153.120` (DigitalOcean, NYC) |
+| user | services run as `scalper`, not root |
+| app | `/home/scalper/btc-scalper` |
+| venv | `.venv/bin/python` — `cryptography` only |
+| services | `btc-logger`, `btc-runner` |
+| health | `scalper-health` |
+| backups | `predictions.jsonl` copied nightly to `~/backups`, kept 14 days |
+
+Useful commands:
+
+    scalper-health                       alive? still writing?
+    journalctl -u btc-logger -n 50       what went wrong
+    systemctl restart btc-logger
+    touch /home/scalper/btc-scalper/KILL stop the runner placing orders
+    cd /home/scalper/btc-scalper && .venv/bin/python score.py
+    cd /home/scalper/btc-scalper && .venv/bin/python makerstats.py
+
+**It does not stop on its own.** `Restart=always` with
+`StartLimitIntervalSec=0` means systemd never gives up — the default stops
+retrying after five failures in ten seconds, which would turn a brief outage
+into a silent permanent stop. It also survives reboots. Only stopping it,
+destroying the droplet, or not paying ends it.
+
+Two deployment details that cost time and will again if forgotten:
+
+- **Relative paths need a working directory.** The credentials file names
+  the key as `kalshi-demo.key`, relative to the process's cwd. Running from
+  `/root` looked for `/root/kalshi-demo.key` and failed with a
+  `PermissionError` that read like a permissions bug. The systemd units set
+  `WorkingDirectory` explicitly, which is why the services do not hit this.
+- **Clock sync is load-bearing.** Kalshi signs the millisecond timestamp, so
+  a drifting clock produces a 401 indistinguishable from a bad key. `chrony`
+  is installed by `setup.sh` for exactly this. Check `timedatectl` before
+  suspecting credentials.
+
+Secrets are gitignored and do not clone; they were copied with `scp`.
 
 ---
 
@@ -147,12 +223,23 @@ relying on it.**
 ## OPEN ITEMS, IN ORDER
 
 1. **Test whether resting orders actually fill.** This is now the central
-   question, not the model. Point `runner.py` at the bid instead of the ask
-   on demo and measure: what fraction fill, how long they wait, and at what
-   prices. `--fill bid` in replay is a *ceiling* — it assumes every resting
-   order fills at the quoted bid, and ignores adverse selection (a resting
-   buy fills when someone sells into it, and they sell into it when price is
-   about to drop). Real maker P&L will be lower. Possibly by all of it.
+   question, not the model. `runner.py` on demo already does this — it posts
+   post-only at the bid, watches until T-30s, cancels what is left, and logs
+   fills with the seconds-to-first-fill. Then `python makerstats.py` reads
+   `runner.jsonl` and reports:
+
+       fill rate           what fraction got taken. An edge you cannot
+                           execute is not an edge.
+       wait times          fills under 30 seconds mean the quote was already
+                           stale — a taker fill wearing a maker label.
+       adverse selection   was the model right MORE often on the windows
+                           that did not fill? Someone sells into your bid
+                           when they want out, and they want out when the
+                           price is about to move against you.
+
+   `--fill bid` in replay is a *ceiling*: it assumes every resting order
+   fills at the quoted bid and ignores both of the above. Real maker P&L
+   will be lower. Possibly by all of it.
 
 2. **Keep logging.** The maker result rests on 26 held-out trades, below the
    30-trade minimum. Needs more windows before it means anything.
@@ -193,6 +280,18 @@ only when adversely selected. That would mean the edge exists on paper and
 cannot be captured.
 
 ---
+
+## A MISTAKE WORTH NOT REPEATING
+
+Late in the session I rewrote `runner.py` to add a maker mode without first
+reading the `runner.py` that was already there. The existing one was better —
+post-only ordering, kill-switch-on-unreadable-order, plan file hashing, a
+settlement sync gate — and my version was a downgrade that broke 16 tests.
+It was restored from commit `dbf948d`.
+
+The lesson is cheap to state and was expensive to learn twice this week:
+read the file before editing it. The test suite caught it, which is the
+argument for the test suite.
 
 ## A NOTE FOR NEXT TIME
 
