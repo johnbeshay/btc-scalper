@@ -40,6 +40,37 @@ WHAT IT MEASURES
      that usually kills round trips: a round trip has TWO chances to lose
      the spread where holding to settlement has one.
 
+THE CONFOUND, AND THE CONTROL FOR IT
+------------------------------------
+A positive slope has a boring explanation that needs no model at all. If the
+book's quote at the entry reading is briefly off - a stale level, a thin
+moment, a bid that just got lifted - then:
+
+    disagreement = model - book_entry   contains  - noise
+    move         = book_exit - book_entry contains - noise   (it reverts)
+
+The same noise sits in both, with the same sign, so they correlate. The book
+"moves toward the model" only because the book was temporarily wrong and
+went back to where it was. A model that knew nothing would show it too.
+
+The control uses a reading the noise cannot reach. Take the model's
+disagreement at the entry reading, and the book's move between two LATER
+readings. Entry-time quote noise is not in that later move, so it cannot
+manufacture a correlation. (It is still in the regressor, which biases the
+slope toward zero - so a positive slope here is evidence, while a zero slope
+is not quite proof of nothing.)
+
+A second control asks whether the book just drifts toward 50c: the same
+regression with a "model" that always says 0.5. If that shows the same
+slope, the effect is reversion to the middle, and the model's information is
+beside the point.
+
+An earlier idea - a placebo model built by shuffling the real predictions
+between windows - was rejected. The real model tracks the book closely, so
+its disagreements are small; shuffled ones are large. The slope divides by
+that variance, so the real model would look better than the placebo for
+reasons that have nothing to do with information.
+
 WHY THIS COULD BE DIFFERENT FROM EVERYTHING ELSE
 ------------------------------------------------
 Every other test in this project grades the model against the settlement.
@@ -109,6 +140,32 @@ def pairs(rows, entry: int, exit_: int):
             "a": a,
             "b": b,
         })
+    return out
+
+
+def triples(rows, entry: int, mid_h: int, exit_: int):
+    """
+    Per ticker: disagreement at `entry`, and the book's move from `mid_h` to
+    `exit_`. The move skips the entry reading entirely, so noise in the entry
+    quote cannot appear in it.
+    """
+    by_ticker = defaultdict(dict)
+    for r in rows:
+        t = r.get("ticker")
+        if not t or r.get("mkt_p") is None:
+            continue
+        by_ticker[t][r["horizon"]] = r
+    out = []
+    for t, h in by_ticker.items():
+        a, m, b = h.get(entry), h.get(mid_h), h.get(exit_)
+        if not a or not m or not b:
+            continue
+        ma, mm, mb = mid(a), mid(m), mid(b)
+        if None in (ma, mm, mb):
+            continue
+        out.append({"ticker": t, "window_id": a["window_id"],
+                    "disagree": a["p_yes"] - ma, "move": mb - mm,
+                    "center": 0.5 - ma})
     return out
 
 
@@ -251,6 +308,53 @@ def main() -> int:
         print("  No detectable movement toward the model. The book does not")
         print("  come round to the model's view within the window.")
 
+    # ---- 1b. controls ----------------------------------------------------
+    print()
+    print("  1b. Is it the model, or the book correcting itself?")
+    print("  " + "-" * 62)
+
+    # control A: the move between two later readings, skipping entry noise
+    mids = sorted(h for h in (8, 4) if args.exit_ < h < args.entry)
+    control_a = None
+    if mids:
+        mh = mids[-1]
+        tr = triples(rows, args.entry, mh, args.exit_)
+        ca = slope(tr)
+        cci = bootstrap_slope(tr)
+        control_a = (ca, cci)
+        print(f"  model at T-{args.entry} vs book move T-{mh} -> T-{args.exit_}:  "
+              f"{ca:+.3f}", end="")
+        print(f"   [{cci[0]:+.3f} to {cci[1]:+.3f}]" if cci else "")
+        print("  (entry quote noise cannot reach this move)")
+    else:
+        print(f"  no reading between T-{args.entry} and T-{args.exit_} to skip to;")
+        print("  use --entry 12 --exit 4 for the control")
+
+    # control B: a "model" that always says 0.5
+    centre = [dict(p, disagree=0.5 - mid(p["a"])) for p in ps]
+    cb = slope(centre)
+    cbci = bootstrap_slope(centre)
+    print(f"  a model that always says 0.5:            {cb:+.3f}", end="")
+    print(f"   [{cbci[0]:+.3f} to {cbci[1]:+.3f}]" if cbci else "")
+    print("  " + "-" * 62)
+
+    if control_a and control_a[1]:
+        ca, cci = control_a
+        if cci[0] > 0:
+            print("  The slope survives with entry noise removed. The model is")
+            print("  anticipating real moves in the book, not riding a bounce.")
+        elif ci and ci[0] > 0:
+            print("  The slope does NOT survive once entry-quote noise is taken")
+            print("  out. Most likely the book was briefly off at the entry reading")
+            print("  and simply went back - which any model, or none, would 'call'.")
+        else:
+            print("  Inconclusive: neither the raw slope nor the control is")
+            print("  distinguishable from zero.")
+    if cbci and cbci[0] > 0 and ci and b is not None and cb is not None \
+            and abs(cb - b) < 0.5 * abs(b):
+        print("  The always-0.5 model shows a similar slope, so a large part of")
+        print("  this is the book drifting toward the middle, not model skill.")
+
     # ---- 2. the money ----------------------------------------------------
     traded = [p for p in ps if abs(p["disagree"]) >= args.min_edge]
     print()
@@ -294,9 +398,11 @@ def main() -> int:
     tt = results.get("taker in, taker out")
     if tt:
         print()
-        print(f"  Crossing both ways costs {-tt[0] * 100:.2f}c per contract on "
-              f"average - two")
-        print("  spreads and two fees, against one if held to settlement.")
+        verb = "earns" if tt[0] >= 0 else "loses"
+        print(f"  Crossing both ways {verb} {abs(tt[0]) * 100:.2f}c per contract on "
+              "average, after")
+        print("  two spreads and two fees - against one of each if held to")
+        print("  settlement.")
     print()
     return 0
 
