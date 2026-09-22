@@ -133,10 +133,24 @@ def split(rows, fraction=HOLDOUT_FRACTION):
     state, so a random holdout contains near-copies of the training rows and
     every model looks brilliant. Training on the past and testing on the future
     is the only split that answers the question being asked.
+
+    The cut is made between WINDOWS, not between rows. Each window carries up
+    to three readings (T-12, T-8, T-4) with the same outcome, and cutting at a
+    row index could put some of a window's readings in training and the rest
+    in the holdout - so the holdout would contain answers the model had
+    already been fitted on. Small in practice, since at most one window can
+    straddle the boundary, but it is exactly the leak this function exists
+    to prevent.
     """
     rows = sorted(rows, key=lambda r: r["window_id"])
-    cut = int(len(rows) * (1 - fraction))
-    return rows[:cut], rows[cut:]
+    windows = sorted({r["window_id"] for r in rows})
+    if not windows:
+        return [], []
+    cut = int(len(windows) * (1 - fraction))
+    train_w = set(windows[:cut])
+    train = [r for r in rows if r["window_id"] in train_w]
+    test = [r for r in rows if r["window_id"] not in train_w]
+    return train, test
 
 
 @dataclass

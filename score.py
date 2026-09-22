@@ -147,15 +147,24 @@ def load(path: Path, zero_drift: bool = False):
                 if rec.get("ticker") and res in ("yes", "no"):
                     settled[rec["ticker"]] = res
 
+    # A reading is only excluded if NONE of its strikes can be graded.
+    #
+    # The Coinbase close used to be a precondition for the whole reading: no
+    # trustworthy close, no row - even when Kalshi's own settlement for that
+    # exact ticker was sitting in the log. That made the ground truth depend
+    # on the proxy it replaced. Now each strike is graded independently:
+    # Kalshi settlement if there is one, the Coinbase close only as a
+    # fallback, and the row is skipped only when neither exists. `close` is
+    # None on rows graded from settlement with no usable Coinbase close;
+    # callers that need it (basis.py, diagnose.py) must check for that.
     rows, unresolved = [], 0
     for p in preds:
         out = outs.get(p["window_id"])
-        if not out or not out.get("trustworthy", True):
-            unresolved += 1
-            continue
-        close = out["close_price"]
+        close = (out["close_price"]
+                 if out and out.get("trustworthy", True) else None)
         spot = p["spot"]
         sigma = p.get("sigma")
+        graded_any = False
 
         for item in p["predictions"]:
             strike = item["strike"]
@@ -171,9 +180,12 @@ def load(path: Path, zero_drift: bool = False):
                 yes_paid = settled[ticker] == "yes"
                 hit = int(yes_paid if direction == "above" else not yes_paid)
                 hit_source = "kalshi"
-            else:
+            elif close is not None:
                 hit = 1 if close > strike else 0
                 hit_source = "close"
+            else:
+                continue          # neither settlement nor a usable close
+            graded_any = True
 
             rows.append(
                 {
@@ -205,6 +217,8 @@ def load(path: Path, zero_drift: bool = False):
                     "ticker": mkt.get("ticker"),
                 }
             )
+        if not graded_any:
+            unresolved += 1
     return rows, len(preds), unresolved
 
 
@@ -345,7 +359,8 @@ def report(rows, total_preds, unresolved):
     print(f"  {n:,} resolved calls from {rdg:,} readings across {win:,} windows")
     print(f"  the independent unit is the WINDOW: {win:,}")
     if unresolved:
-        print(f"  {unresolved:,} readings excluded (no trustworthy close yet)")
+        print(f"  {unresolved:,} readings excluded "
+              "(no Kalshi settlement and no trustworthy close)")
 
     kalshi_rows = sum(1 for r in rows if r.get("hit_source") == "kalshi")
     close_rows = n - kalshi_rows

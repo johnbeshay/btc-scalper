@@ -227,9 +227,62 @@ class DemoClient:
         """
         return self._request("GET", f"/trade-api/v2/markets/{ticker}")
 
-    def order(self, order_id: str) -> dict:
-        """One order's current state: fills so far, what is still resting."""
-        return self._request("GET", f"/trade-api/v2/portfolio/orders/{order_id}")
+    def list_orders(self, *, ticker: str | None = None,
+                    status: str | None = None,
+                    min_ts: int | None = None,
+                    limit: int = 1000) -> list[dict]:
+        """
+        Orders across ALL exchange shards, optionally filtered.
+
+        Omitting `exchange_index` is what makes this search every shard -
+        per the documentation, the filter returns results from all shards
+        when absent. That is the property `order()` depends on.
+        """
+        q: dict = {"limit": limit}
+        if ticker:
+            q["ticker"] = ticker
+        if status:
+            q["status"] = status
+        if min_ts is not None:
+            q["min_ts"] = min_ts
+        return self._request("GET", "/trade-api/v2/portfolio/orders",
+                             query=q).get("orders") or []
+
+    def order(self, order_id: str, ticker: str | None = None) -> dict:
+        """
+        One order's current state, found on whichever shard holds it.
+
+        WHY NOT GET /portfolio/orders/{order_id}
+        ----------------------------------------
+        That endpoint takes an order id and nothing else - no exchange_index,
+        no ticker - so it can only look on one shard. Crypto markets live on
+        shard 2. The first live order placed by the runner got an HTTP 404
+        from it, the runner concluded it could not see its own order, and
+        the kill switch tripped. The order had in fact filled and settled.
+
+        The list endpoint does take a ticker and searches every shard when
+        no exchange_index is given, so the order is looked up there.
+
+        Pass `ticker` whenever it is known: it makes the lookup exact and
+        cheap. Without it, orders from the last six hours are scanned, which
+        is enough for anything the runner is still watching.
+
+        Returns {"order": {...}}, the same shape the single-order endpoint
+        returned, so callers need no changes. Raises KalshiError if the order
+        cannot be found anywhere.
+        """
+        if ticker:
+            orders = self.list_orders(ticker=ticker)
+        else:
+            since = int(now_utc().timestamp()) - 6 * 3600
+            orders = self.list_orders(min_ts=since)
+        for o in orders:
+            if o.get("order_id") == order_id:
+                return {"order": o}
+        raise KalshiError(
+            f"order {order_id} not found on any shard"
+            + (f" for {ticker}" if ticker else " in the last six hours")
+        )
 
     def series(self, series_ticker: str) -> dict:
         """
@@ -349,18 +402,53 @@ class DemoClient:
             body["post_only"] = True
         return self._request("POST", "/trade-api/v2/portfolio/events/orders", body)
 
-    def cancel(self, order_id: str) -> dict:
+    def cancel(self, order_id: str, ticker: str | None = None,
+               exchange_index: int | None = None) -> dict:
         """
-        Cancel a resting order.
+        Cancel a resting order, on the shard that holds it.
 
-        NOTE: this is still the V1 path. The V2 migration notice named the
-        create endpoint specifically; whether cancel moved too has not been
-        confirmed against the API. If this returns HTTP 410 with a
-        deprecated_v1 code, the same migration applies here and the path
-        needs updating - do not assume it works because create does.
+        V2: DELETE /portfolio/events/orders/{order_id}. The V1 path this
+        replaced returned HTTP 410 deprecated_v1_order_endpoint on the first
+        live order, which is half of what tripped the kill switch.
+
+        ROUTING, WHICH IS THE PART THAT BITES
+        -------------------------------------
+        The documentation is explicit that an order id alone cannot identify
+        the exchange shard. With neither `market_ticker` nor `exchange_index`,
+        the cancel goes to shard 0 - and crypto markets are on shard 2, so it
+        would report the order as not found while it kept resting.
+
+        So this always routes:
+          - with `ticker`: sent as market_ticker, and the exchange auto-routes
+          - with `exchange_index`: sent directly
+          - with neither: the order is looked up first (every shard, via
+            order()) to learn its ticker, then cancelled with it
+
+        It never falls back to shard 0. Cancelling the wrong shard reads as
+        success-shaped failure, and a resting order the runner believes is
+        gone is the worst state this code can leave behind.
+
+        Returns {order_id, client_order_id, reduced_by, ts_ms}; `reduced_by`
+        is how many contracts were still resting when it was cancelled.
         """
+        q: dict = {}
+        if exchange_index is not None:
+            q["exchange_index"] = exchange_index
+        elif ticker:
+            q["market_ticker"] = ticker
+        else:
+            found = self.order(order_id).get("order") or {}
+            if found.get("ticker"):
+                q["market_ticker"] = found["ticker"]
+            elif found.get("exchange_index") is not None:
+                q["exchange_index"] = found["exchange_index"]
+            else:
+                raise KalshiError(
+                    f"cannot route cancel for {order_id}: no ticker or shard"
+                )
         return self._request(
-            "DELETE", f"/trade-api/v2/portfolio/orders/{order_id}"
+            "DELETE", f"/trade-api/v2/portfolio/events/orders/{order_id}",
+            query=q,
         )
 
 
