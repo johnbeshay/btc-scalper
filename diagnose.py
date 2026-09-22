@@ -55,7 +55,8 @@ LOG = Path(__file__).parent / "predictions.jsonl"
 
 def check_disagreement_vs_move(rows) -> None:
     priced = [r for r in rows
-              if r["mkt_p"] is not None and r.get("sigma") and r["sigma"] > 0]
+              if r["mkt_p"] is not None and r.get("sigma") and r["sigma"] > 0
+              and r.get("close")]   # rows graded from settlement may have no close
     if len(priced) < 40:
         print("  too few priced rows for this check")
         return
@@ -158,7 +159,13 @@ def check_settlement_truth(rows, series: str) -> None:
         if not t or t not in results:
             continue
         # our view: did YES pay, per the Coinbase close?
-        our_yes = r["hit"] if r.get("yes_direction", "above") == "above" else 1 - r["hit"]
+        # Coinbase outcome from the close itself - r["hit"] is Kalshi-graded now,
+        # so reading it here compared Kalshi against Kalshi.
+        close = r.get("close")
+        if close is None:
+            continue
+        cb_above = 1 if close > r["strike"] else 0
+        our_yes = cb_above if r.get("yes_direction", "above") == "above" else 1 - cb_above
         their_yes = 1 if results[t] == "yes" else 0
         if our_yes == their_yes:
             agree += 1
